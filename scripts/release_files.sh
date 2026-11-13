@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A release's files, found and changed by the release's id: the Release workflow's releases are drafts until its
 # publish job, and GitHub's get-a-release-by-tag (and so `gh release view <tag>`, which falls back to a second lookup
 # for drafts) finds only a published one. A failed lookup must never read as "no release", so the release of a tag is

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # rc, the latest release candidate: a rolling prerelease, never "latest" and not a version, that holds the Linux AppImage
 # and its .zsync of the newest published release candidate or release (semver: v2.1.0-rc.2 < v2.1.0-rc.3 < v2.1.0, as
 # the builder's Release candidate Update track has it, builder/linux/linux_update.py). A release candidate's AppImage

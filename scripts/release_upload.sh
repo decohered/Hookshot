@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A tag's GitHub release with these files attached. The Linux AppImage and Windows builder workflows both call it. For
 # a release from the Release workflow (RELEASE_FROM_WORKFLOW=true: it passed the tag), the release is there already, a
 # draft made by release-please or Promote, and the files are only added; when it is not there, this stops and makes

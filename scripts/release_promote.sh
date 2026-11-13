@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Promote: a release candidate (v2.1.0-rc.2) published as its version (v2.1.0), the release players get. The Release
 # workflow runs this when it is started by hand (docs/versioning.md, "Promoting a release candidate"). Needs gh, with
 # GH_TOKEN (contents: write) and GH_REPO set.
