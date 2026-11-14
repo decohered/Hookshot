@@ -6,7 +6,9 @@ unit's command to its end, as the jobs test does), and the enter-closure script 
 Checks: the closure is resolved, refused outside the store, copied and pinned; the SHA is the revision's full id and its tree
 is the one built; make_game runs through the closure entry as one job with its environment; the record (stdout and
 build.txt) holds the closure, the SHA, the dirty diff and both hashes, and the hashes are the files'; a clean checkout says
-none; a dirty one gives the diff's sha256 and the diff; a failed build returns its status; an unknown rev returns 2 before
+none; a dirty one gives the diff's sha256 and the diff; a successful build prints only its record, with make_game's console
+output in console.log on the host and devenv's output shown only when devenv shell fails; a failed build prints its status,
+the console.log path and its last 20 lines, and returns the status; an unknown rev returns 2 before
 anything reaches the host; a refused start returns 1; a lost ssh returns 255; a failed copy returns 1; the dirty diff is the
 one from before the build, even when the checkout changes during it; a build folder keeps the record of the build that last
 succeeded there, or none. Nothing reaches a real host.
@@ -41,10 +43,11 @@ FAKE_NAMES = ("ssh", "nix", "nix-store", "devenv", "systemd-run", "systemctl")
 
 # The fakes, in one Python file that the shims run as: python -I fakes.py <tool> <arguments>. Every call is recorded as a
 # JSON list in $FAKE_LOG. ssh takes what remote.command builds and runs its command word with sh, as a login shell would.
-# devenv makes .devenv/gc/shell, a link to $FAKE_CLOSURE, and with $FAKE_DEVENV_EDIT set it first rewrites that file. nix fails when $FAKE_NIX_FAIL is set. systemd-run takes the
-# options the start script passes and runs the unit's command to its end, in the foreground, with its --setenv variables,
-# its --working-directory and its append: outputs; then it returns 0. systemctl lists no units and answers is-active
-# inactive. ssh loses the connection on the follow script when $FAKE_SSH_LOSE is set.
+# devenv prints a line to each stream, and with $FAKE_DEVENV_FAIL set it returns 1 before it makes .devenv/gc/shell, a link
+# to $FAKE_CLOSURE; with $FAKE_DEVENV_EDIT set it first rewrites that file. nix fails when $FAKE_NIX_FAIL is set.
+# systemd-run takes the options the start script passes and runs the unit's command to its end, in the foreground, with
+# its --setenv variables, its --working-directory and its append: outputs; then it returns 0. systemctl lists no units and
+# answers is-active inactive. ssh loses the connection on the follow script when $FAKE_SSH_LOSE is set.
 FAKE_TOOLS = r'''
 import json
 import os
@@ -85,6 +88,10 @@ def nix_store(args):
 
 def devenv(args):
     record("devenv", args)
+    print("devenv: stand-in output")
+    print("devenv: stand-in warning", file=sys.stderr)
+    if os.environ.get("FAKE_DEVENV_FAIL"):
+        return 1
     if os.environ.get("FAKE_DEVENV_EDIT"):
         with open(os.environ["FAKE_DEVENV_EDIT"], "w", encoding="utf-8") as f:
             f.write("edited during the closure evaluation\n")
@@ -155,7 +162,8 @@ sys.exit(tools[sys.argv[1]](sys.argv[2:]))
 '''
 
 # The stand-in for nx2/make_game.py: it writes the two binaries and the log, and exits with $HX_STANDIN_STATUS. With
-# $HX_STANDIN_EDIT set, it also rewrites that file, as an edit to the checkout while the build runs.
+# $HX_STANDIN_EDIT set, it also rewrites that file, as an edit to the checkout while the build runs. As make_game's console
+# output it prints a marker on each stream, then 25 numbered lines on stdout.
 MAKE_GAME = r'''"""A stand-in for nx2/make_game.py: it writes the two binaries and the log, and exits with HX_STANDIN_STATUS."""
 import argparse
 import os
@@ -167,6 +175,10 @@ parser.add_argument("--nup")
 parser.add_argument("--out", required=True)
 parser.add_argument("--log", required=True)
 args = parser.parse_args()
+print("stand-in stdout marker", flush=True)
+print("stand-in stderr marker", file=sys.stderr, flush=True)
+for n in range(1, 26):
+    print("stand-in line %02d" % n, flush=True)
 out = pathlib.Path(args.out)
 out.mkdir(parents=True, exist_ok=True)
 (out / "hookshot").write_bytes(b"stand-in executable\n")
@@ -221,7 +233,8 @@ class BuildTests(unittest.TestCase):
         })
         env.start()
         self.addCleanup(env.stop)
-        for var in ("FAKE_NIX_FAIL", "FAKE_SSH_LOSE", "FAKE_DEVENV_EDIT", "HX_STANDIN_STATUS", "HX_STANDIN_EDIT"):
+        for var in ("FAKE_NIX_FAIL", "FAKE_SSH_LOSE", "FAKE_DEVENV_FAIL", "FAKE_DEVENV_EDIT", "HX_STANDIN_STATUS",
+                    "HX_STANDIN_EDIT"):
             os.environ.pop(var, None)
         self.make_checkout()
 
@@ -287,6 +300,7 @@ class BuildTests(unittest.TestCase):
         dirty = sha256(diff) if diff else "none"
         head = self.record_text(sha, job, dirty).encode("utf-8")
         self.assertEqual(proc.stdout, head + diff)
+        self.assertEqual(proc.stderr, b"")
         self.assertEqual((self.build_dir(sha) / "build.txt").read_bytes(), head)
         self.assertEqual((self.build_dir(sha) / "dirty.diff").exists(), bool(diff))
         if diff:
@@ -425,8 +439,39 @@ class BuildTests(unittest.TestCase):
         proc = self.run_build("HEAD")
         self.assertExit(proc, 3)
         build = self.build_dir(self.head())
-        self.assertIn(("build failed: exit status 3; log: %s" % (build / "build.log")).encode("utf-8"), proc.stdout)
+        self.assertIn(("build failed: exit status 3; log: %s" % (build / "console.log")).encode("utf-8"), proc.stdout)
         self.assertFalse((build / "build.txt").exists())
+
+    # DL58: make_game's console output stays in console.log on the host; hx build prints only the record
+
+    def test_dl58_make_games_console_output_is_in_console_log_on_the_host_and_not_in_the_output(self):
+        proc = self.run_build("HEAD")
+        self.assertExit(proc, 0)
+        self.assert_record(proc, self.head())
+        console = (self.build_dir(self.head()) / "console.log").read_text(encoding="utf-8")
+        self.assertIn("stand-in stdout marker\n", console)
+        self.assertIn("stand-in stderr marker\n", console)
+        self.assertIn("stand-in line 25\n", console)
+
+    def test_dl58_devenv_output_is_printed_only_when_devenv_shell_fails(self):
+        os.environ["FAKE_DEVENV_FAIL"] = "1"
+        proc = self.run_build("HEAD")
+        self.assertExit(proc, 1)
+        self.assertEqual(proc.stdout, b"")
+        self.assertIn(b"devenv: stand-in output\n", proc.stderr)
+        self.assertIn(b"devenv: stand-in warning\n", proc.stderr)
+        self.assertIn(b"devenv shell -- true failed with status 1", proc.stderr)
+        self.assertEqual(self.calls("nix"), [])
+
+    def test_dl58_a_failed_build_prints_the_console_log_path_and_its_last_20_lines(self):
+        os.environ["HX_STANDIN_STATUS"] = "3"
+        proc = self.run_build("HEAD")
+        self.assertExit(proc, 3)
+        console = self.build_dir(self.head()) / "console.log"
+        lines = console.read_text(encoding="utf-8").splitlines()
+        self.assertGreater(len(lines), 20)
+        self.assertEqual(proc.stdout.decode("utf-8").splitlines(),
+                         ["build failed: exit status 3; log: %s" % console] + lines[-20:])
 
     def test_an_unknown_rev_returns_2_before_anything_reaches_the_host(self):
         proc = self.run_build("no-such-revision")

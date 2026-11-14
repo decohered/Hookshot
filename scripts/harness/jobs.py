@@ -1,7 +1,9 @@
 """The harness's jobs on the build host. Each job is a transient systemd user unit, hx-<job id>.service, that outlives the
 ssh session that started it, in a folder of its own under the harness root. start() runs one guarded script over ssh:
-under the start lock it refuses while the hold file exists and while a job the kind forbids is running (a bench runs
-alone), then makes the job folder, unpacks the tools, copies the build's game folder in and starts the unit. follow()
+under the start lock it refuses while the hold file exists, while a job the kind forbids is running (a bench runs
+alone), and while the harness root has under twice the kind's last size free; then it makes the job folder, unpacks the
+tools, copies the build's game folder in and starts the unit. When a job's command ends, its wrapper records the job
+folder's exclusive size as its kind's last size, removes the job's game folder, and writes the exit file. follow()
 prints a job's output to its end and returns its status. wait_hold() is what a job runs before each launch.
 
 Every path and value that reaches the host is shell-quoted, and a job id is checked against the new_id shape before it
@@ -24,10 +26,27 @@ import remote
 KINDS = ("build", "check", "bench")
 HELD = 75
 BUSY = 76
+LOW_SPACE = 77
 CHECKOUT = Path(__file__).resolve().parents[2]
 JOB_ID = re.compile(r"(build|check|bench)-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 BUILD_SHA = re.compile(r"[0-9a-f]{7,64}")
-WRAPPER = 'f=$1; shift; "$@"; s=$?; echo "$s" > "$f"; exit "$s"'
+# The job's wrapper, run as bash -c WRAPPER hx <exit file> <job folder> <kind's size file> <argv...>. It runs the argv,
+# records the job folder's exclusive size as the kind's last size (when btrfs cannot measure it, the job's output says
+# so and the size is left as it was), removes the job's game folder, and only then writes the exit file.
+WRAPPER = r"""f=$1; job=$2; size_file=$3; shift 3
+"$@"; s=$?
+excl=
+if du=$(btrfs filesystem du -s --raw "$job"); then
+  read -r _ excl _ <<< "$(printf '%s\n' "$du" | tail -n 1)"
+fi
+case $excl in
+  ''|*[!0-9]*) echo "job size: btrfs cannot measure $job; the last size of its kind is unchanged" ;;
+  *) printf '%s\n' "$excl" > "$size_file.tmp" && mv -f "$size_file.tmp" "$size_file" ;;
+esac
+rm -rf -- "$job/game"
+echo "$s" > "$f"
+exit "$s"
+"""
 
 
 class JobError(Exception):
@@ -73,18 +92,20 @@ def tools_tar(checkout=CHECKOUT):
 
 
 def start_script(cfg, job_id, argv, env=None, game=None):
-    """The bash script that starts job_id. It runs under the start lock and checks the hold before the folder is made and
-    again just before the unit starts, so a hold that appears while the folder is copied still stops the unit."""
+    """The bash script that starts job_id. It runs under the start lock and checks the hold before the folder is made
+    and again just before the unit starts, so a hold that appears while the folder is copied still stops the unit.
+    A kind with a last size is refused while the harness root's filesystem has under twice that free."""
     if not argv:
         raise JobError("a job needs a command to run")
     job = job_dir(cfg, job_id)
     kind = job_id.split("-")[0]
+    size_file = posixpath.join(cfg.root, "jobs", kind + ".size")
     log = posixpath.join(job, "output.log")
     q = shlex.quote
     head = ["systemd-run", "--user", "--unit=" + unit(job_id), "--collect", "--working-directory=" + job]
     head += ["--setenv=%s=%s" % kv for kv in (env or {}).items()]
     head += ["--property=StandardOutput=append:" + log, "--property=StandardError=append:" + log]
-    tail = [WRAPPER, "hx", posixpath.join(job, "exit")] + list(argv)
+    tail = [WRAPPER, "hx", posixpath.join(job, "exit"), job, size_file] + list(argv)
     lines = [
         "set -eu",
         "root=%s" % q(cfg.root),
@@ -112,6 +133,17 @@ def start_script(cfg, job_id, argv, env=None, game=None):
         '  echo "busy: refused while running:$busy" >&2',
         "  exit %d" % BUSY,
         "fi",
+        "size_file=%s" % q(size_file),
+        'if [ -f "$size_file" ]; then',
+        '  last=$(cat "$size_file")',
+        '  free_out=$(df --output=avail -B1 "$root")',
+        '  free=$(echo "$free_out" | tail -n 1)',
+        '  [ "$free" -ge $((2 * last)) ] || {',
+        '    echo "disk: refused: $free bytes free in $root, under $((2 * last))"'
+        ' "(twice the last $kind size, $last)" >&2',
+        "    exit %d" % LOW_SPACE,
+        "  }",
+        "fi",
         'mkdir -p "$root/jobs"',
         'mkdir "$job"',
         'mkdir "$job/data" "$job/tools"',
@@ -130,7 +162,7 @@ def start_script(cfg, job_id, argv, env=None, game=None):
 
 def start(cfg, job_id, argv, env=None, game=None, checkout=CHECKOUT):
     """Starts job_id as a unit running argv in its folder. Raises JobError with the script's message when it is refused
-    (HELD, BUSY) or fails."""
+    (HELD, BUSY, LOW_SPACE) or fails."""
     script = start_script(cfg, job_id, argv, env, game)
     try:
         remote.run(cfg.host, script, input=tools_tar(checkout))
