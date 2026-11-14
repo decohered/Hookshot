@@ -107,6 +107,8 @@ in
     pkgs.spirv-tools
     pkgs.glslang
     pkgs.dotnet-sdk
+    # NVIDIA's FLIP image-difference tool (`flip`): the harness's image gate compares screenshots perceptually with it.
+    pkgs.flip
   ];
 
   # nixpkgs' compilers add hardening flags (-fPIC, _FORTIFY_SOURCE even without -O, stack protection, ...) that the

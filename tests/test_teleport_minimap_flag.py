@@ -9,7 +9,9 @@ flags separate: only processing an engine-setter request updates both. It checks
 
 - an accepted teleport queues the repair, preserves the caller's registers, and survives a simulated save/reload;
 - an already-visible minimap does not queue a write or log a repair;
-- a refused/throttled teleport, or an event-manager answer of 0, changes neither live nor serialized state;
+- a refused/throttled teleport changes neither live nor serialized state;
+- an event-manager answer of 0 is refused with its own reason, starts no gap (the next request goes at once), and
+  changes neither live nor serialized state;
 - unavailable setter bindings do not fall back to a misleading live-only repair.
 
 python -I -B tests/test_teleport_minimap_flag.py [--cc gcc]
@@ -162,14 +164,22 @@ int main(void) {
     check(hidden(), "a teleport that was ignored showed the minimap");
     check(set_calls == 2 && !pending && saved_hidden, "a throttled teleport changed the saved state");
 
-    clock_ns += 9000000000LL, answer = 0;   /* sent, but the event manager does not take it: the map does not change */
-    check(oot_teleport(&c, 0x50000000ULL, 1) == 1 && requests == 4, "the teleport the game turned down was not sent");
-    check(hidden(), "a teleport the game turned down showed the minimap of the area Link is still in");
+    clock_ns += 9000000000LL, answer = 0, said[0] = 0;   /* the event manager answers 0: it does not take the request */
+    check(oot_teleport(&c, 0x50000000ULL, 1) == 0 && requests == 4, "a request the event manager answered 0 to was not refused");
+    check(strcmp(teleport.why, "the game's event manager declined the request") == 0, "a declined request gave another reason");
+    check(strstr(said, "request sent, result 0") != NULL, "the log does not record the event manager's answer");
+    check(hidden(), "a declined teleport showed the minimap of the area Link is still in");
     check(set_calls == 2 && !pending && saved_hidden, "a declined request changed the saved state");
 
-    clock_ns += 9000000000LL, answer = 1, set_available = 0, said[0] = 0;
-    check(oot_teleport(&c, 0x50000000ULL, 1) == 1 && requests == 5, "the teleport with no setter binding was not sent");
-    check(hidden() && saved_hidden && set_calls == 2 && !pending, "a missing setter fell back to a live-only write");
+    answer = 1;   /* (no clock advance: a declined request starts no gap, so the next request goes at once) */
+    check(oot_teleport(&c, 0x50000000ULL, 1) == 1 && requests == 5, "a request right after a declined one was not sent");
+    check(set_calls == 3 && pending, "the teleport after a declined one did not queue the repair");
+    game_tick();
+    check(!hidden() && !saved_hidden, "the teleport after a declined one left the minimap hidden");
+
+    clock_ns += 9000000000LL, hide(1), answer = 1, set_available = 0, said[0] = 0;
+    check(oot_teleport(&c, 0x50000000ULL, 1) == 1 && requests == 6, "the teleport with no setter binding was not sent");
+    check(hidden() && saved_hidden && set_calls == 3 && !pending, "a missing setter fell back to a live-only write");
     check(strstr(said, "restore queued") == NULL, "a missing setter logged a successful repair");
     check(strstr(said, "the game's Bool setter not found, left hidden") != NULL, "a missing setter was not named in the log");
     return failed;

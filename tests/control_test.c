@@ -181,13 +181,26 @@ static int fake_destination(int i, const char **child, const char **adult) {
 }
 /* (the age switch: asked as a teleport is, with teleport_asked = AGE_ASKED + 1 for the adult, + 0 the child; taken, Link
    that age already: nothing done (result 2), else his age flips and the map reloads in it, as hos_main.c does.
-   stale_age: the state's sample of the age is the other one, as an old sample can be) */
+   stale_age: the state the game read has the other age, as a read from before a change can be) */
 enum { AGE_ASKED = 100 };
 static volatile int fake_child = 1, stale_age;
-static int fake_state(int *event, int *loading, int *child) {
-    if (!fake_map(NULL, 0)) return 0;
-    *event = 0, *loading = 1, *child = __atomic_load_n(&fake_child, __ATOMIC_RELAXED) ^ (stale_age != 0);
-    return 1;
+/* the state as the game's thread read it at its last update (log_lock): none until a map is there, and the frame it was
+   read on (fake_read_state, at each update, as hos_main.c reads it with the player's) */
+static int state_have, state_child;
+static int64_t state_frame;
+static void fake_read_state(void) {
+    log_lock();
+    if (fake_map_now[0])
+        state_have = 1, state_child = __atomic_load_n(&fake_child, __ATOMIC_RELAXED) ^ (stale_age != 0),
+        state_frame = fake_frame();
+    log_unlock();
+}
+static int fake_state(int *event, int *loading, int *child, int64_t *frame) {
+    log_lock();
+    const int have = state_have;
+    if (have) *event = 0, *loading = 1, *child = state_child, *frame = state_frame;
+    log_unlock();
+    return have;
 }
 static int fake_teleport(int i) {
     if (i < 0 || i >= 3) return 0;
@@ -262,6 +275,7 @@ static void *game_thread(void *unused) {
                 log_unlock();
             }
         }
+        fake_read_state();
         const int64_t f = fake_frame();
         if (f < FRAMES) seen_buttons[f] = b, memcpy(seen_stick[f], st, sizeof st), seen_exclusive[f] = ex;
         draws_total += (int64_t)draws_per_frame;
@@ -364,8 +378,8 @@ static void ask(Client *c, const char *req, const char *id_text, char *out, size
         if (!strncmp(out, want, strlen(want))) return;
     }
 }
-/* status until its line has want (and want2, if given), asked again for at most ms: its game state is the one the
-   bridge's thread samples every 100 ms, so a change shows within that, not at the next frame */
+/* status until its line has want (and want2, if given), asked again for at most ms: a change the game reads shows in the
+   status that follows its next update */
 static void status_until(Client *c, const char *id_text, const char *want, const char *want2, char *out, size_t cap,
                          int ms) {
     char req[64];
@@ -392,6 +406,12 @@ static long long num_after(const char *s, const char *key) {
     const char *p = strstr(s, key);
     CHECK(p);
     return atoll(p + strlen(key));
+}
+/* the frame in a status reply's game object, -1 when it has none */
+static long long game_frame_of(const char *line) {
+    const char *g = strstr(line, "\"game\":{"), *end = g ? strchr(g, '}') : NULL;
+    const char *f = end ? strstr(g, "\"frame\":") : NULL;
+    return f && f < end ? atoll(f + strlen("\"frame\":")) : -1;
 }
 /* a reply's "path", its JSON escapes (a Windows path's backslashes) undone */
 static void path_of(const char *line, char *out, size_t cap) {
@@ -991,7 +1011,8 @@ int main(int argc, char **argv) {
         wait_frames(5);
         ask(c, "{\"id\":78,\"cmd\":\"status\"}\n", "78", line, sizeof line, 2000);
         CHECK(strstr(line, "\"map\":\"KokiriForest_Child\"") &&
-              strstr(line, "\"game\":{\"event\":false,\"loading\":true,\"age\":\"child\"}"));
+              strstr(line, "\"game\":{\"event\":false,\"loading\":true,\"age\":\"child\",\"frame\":") &&
+              game_frame_of(line) >= 0);
         /* the age switch: none is the other age, and the reply has it and the map it reloads; to the age Link has already:
            said, nothing done; anything but child or adult: a bad request */
         ask(c, "{\"id\":79,\"cmd\":\"age\",\"to\":\"teen\"}\n", "79", line, sizeof line, 2000);
@@ -1003,10 +1024,11 @@ int main(int argc, char **argv) {
               strstr(line, "\"age\":\"adult\",\"sent\":true,\"map\":\"KokiriForest_Adult\",\"accepted\":true"));
         status_until(c, "793", "\"age\":\"adult\"", NULL, line, sizeof line, 2000);
         CHECK(strstr(line, "\"age\":\"adult\""));
-        /* the bridge's sample of the age old (it says the child, Link is the adult): the game checks the age asked for when
-           it takes it, so "adult" does not flip the adult into the child, and none (the other age by the sample: the
-           adult) neither; both say the adult already */
+        /* the age the game read at its last update is old (it says the child, Link is the adult): the game checks the age
+           asked for when it takes it, so "adult" does not flip the adult into the child, and none (the other age by that
+           state read: the adult) neither; both say the adult already */
         stale_age = 1;
+        wait_frames(3);   /* (the game's next update reads the stale age) */
         ask(c, "{\"id\":7931,\"cmd\":\"age\",\"to\":\"adult\"}\n", "7931", line, sizeof line, 3000);
         CHECK(strstr(line, "\"ok\":true") && strstr(line, "\"age\":\"adult\",\"sent\":false"));
         CHECK(__atomic_load_n(&fake_child, __ATOMIC_RELAXED) == 0);
@@ -1033,6 +1055,31 @@ int main(int argc, char **argv) {
         CHECK(strstr(line, "\"map\":\"KokiriForest_Child\"") && strstr(line, "\"age\":\"child\""));
         hangup(sub);
         puts("PASS: (OoT) the map in status, events and waits; the teleport by index or map, and its list; the age switch");
+    }
+
+    /* (OoT) the status's game object is the state the game read at its last update, with the frame it read it on: a change
+       the game reads shows in the next status, not at a 100 ms sample's, and the frame moves on with each read */
+    {
+        long long last = -1;
+        for (int i = 0; i < 6; i++) {
+            const int child = (i & 1) == 1;   /* (flipped each time: adult, child, ...) */
+            __atomic_store_n(&fake_child, child, __ATOMIC_RELAXED);
+            wait_frames(3);   /* (the game's next updates read it) */
+            ask(c, "{\"id\":80,\"cmd\":\"status\"}\n", "80", line, sizeof line, 2000);
+            CHECK(strstr(line, child ? "\"age\":\"child\"" : "\"age\":\"adult\""));
+            CHECK(game_frame_of(line) > last);
+            last = game_frame_of(line);
+        }
+        /* paused, nothing is read between the status and the frame the fake game read its state on: they are the same */
+        paused = 1;
+        sleep_ms(10);
+        ask(c, "{\"id\":81,\"cmd\":\"status\"}\n", "81", line, sizeof line, 2000);
+        log_lock();
+        const int64_t read_on = state_frame;
+        log_unlock();
+        CHECK(game_frame_of(line) == read_on);
+        paused = 0;
+        puts("PASS: (OoT) the status's game state: read at the game's update, with its frame; a change shows at once");
     }
 
     /* a client gone in the middle of a press: its input is let go */

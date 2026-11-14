@@ -422,10 +422,12 @@ def answer(req):
     if cmd == "status":
         return {"ok": True, "frame": ticks[0], "replayed": ticks[0], "draws": 2410.3,
                 "renderer": env["FAKE_RENDERER"], "state": "play", "map": here[0],
-                "game": {"event": False, "loading": False, "age": "child"}}
+                "game": {"event": False, "loading": False, "age": "child", "frame": ticks[0]}}
     if cmd == "teleport":
         here[0] = "dest_%s" % req["to"]
-        return {"ok": True, "frame": ticks[0], "teleport": 1, "sent": True, "map": here[0]}
+        frame = ticks[0]
+        ticks[0] += 1   # the teleport takes one present, after its reply
+        return {"ok": True, "frame": frame, "teleport": 1, "sent": True, "map": here[0]}
     if cmd == "age":
         return {"ok": True, "frame": ticks[0], "age": req["to"], "sent": True, "map": here[0]}
     if cmd == "sequence":
@@ -730,20 +732,20 @@ class RunInJobTest(RunFixture):
         self.assertIn(b"stand-in: started", self.record_file("log.txt"))
         trace = self.record_file("hookshot_frames.csv").decode("utf-8").splitlines()
         self.assertEqual(trace[0], ",".join(metrics.TRACE_COLUMNS))
-        self.assertEqual(len(trace), 1 + 7200)
+        self.assertEqual(len(trace), 1 + 7201)
         report = json.loads(self.record_file("metrics.json"))
-        self.assertEqual(report["trace"]["rows"], 7200)
+        self.assertEqual(report["trace"]["rows"], 7201)
         self.assertEqual(sorted(report["trace"]["columns"]), sorted(metrics.TRACE_COLUMNS[1:]))
-        self.assertEqual(report["frame_time_ms"]["n"], 7200)
+        self.assertEqual(report["frame_time_ms"]["n"], 7201)
         self.assertEqual(report["replay_ms"]["submit"]["mean"], 1.0)
         self.assertEqual(report["gpu_ms"]["max"], 12.5)
         self.assertEqual(report["longest_submission_ms"]["max"], 3.25)
         self.assertEqual(report["rss_mb"]["peak_mb"]["max"], 600)
         self.assertEqual(report["vram_mb"]["used_mb"]["max"], 1024)
         self.assertEqual(report["hangs"]["exit_status"], 0)
-        self.assertEqual((report["window"]["first"], report["window"]["last"]), (0, 7200))
-        self.assertEqual(report["window"]["trace"]["rows"], 7200)
-        self.assertEqual(report["window"]["frame_time_ms"]["n"], 7200)
+        self.assertEqual((report["window"]["first"], report["window"]["last"]), (1, 7201))
+        self.assertEqual(report["window"]["trace"]["rows"], 7201)
+        self.assertEqual(report["window"]["frame_time_ms"]["n"], 7201)
 
     # R6: a held-out scene runs only with --final; anything refused exits 2 before the game is launched or recorded
 

@@ -141,7 +141,8 @@ def reply(req):
         after = state["after_stick"]
         return {"ok": True, "frame": frame, "replayed": frame, "draws": 2410.5, "state": "play",
                 "map": "Other_area" if after == "map" else state["map"],
-                "game": {"event": after == "event", "loading": after == "loading", "age": state["age"]},
+                "game": {"event": after == "event", "loading": after == "loading", "age": state["age"],
+                         "frame": frame},
                 "renderer": renderer}
     if cmd == "wait":
         if req.get("event") == "present":
@@ -169,6 +170,7 @@ def reply(req):
         if target is None or str(req["to"]) == env.get("FAKE_REFUSE_TO", ""):
             return {"ok": False, "frame": frame, "error": "refused", "message": "no map for this age here"}
         state["map"] = target
+        state["frame"] += 1   # the teleport takes one present, after its reply
         return {"ok": True, "frame": frame, "teleport": 1, "child": dest["child"], "adult": dest["adult"],
                 "sent": True, "map": target}
     if cmd == "age":

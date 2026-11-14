@@ -106,7 +106,7 @@ replies are out. (Linux; a Windows pipe has no half-close.)
 | `out_of_range` | a memory address or range outside mapped guest memory |
 | `not_found` | no such setting |
 | `failed` | a shot could not be written |
-| `refused` | the game turned a teleport down (an event playing, a map loading, ...); the message says why |
+| `refused` | the game turned a teleport down (an event playing, a map loading, the event manager declined it, ...); the message says why |
 | `cancelled` | a press that was waited on was let go by `release`, or a teleport was replaced by a later one |
 
 ### Frames and inputs
@@ -135,15 +135,17 @@ version.
 > {"id":1,"cmd":"status"}
 < {"id":1,"ok":true,"frame":5321,"protocol":1,"fps":59.8,"state":"play","stalled":false,"draws":2410.3,"replayed":5320,
    "window":{"width":1280,"height":720},"uptime":95.2,"clients":1,"input":{"queued":0,"exclusive":false},
-   "map":"KokiriForest_Child","game":{"event":false,"loading":false,"age":"child"},"version":"1.4.0-abc123",
+   "map":"KokiriForest_Child","game":{"event":false,"loading":false,"age":"child","frame":5320},"version":"1.4.0-abc123",
    "renderer":"Vulkan: ..."}
 ```
 
-`map` is the game's own name for the map (`Sequence_CurrentBanc`), read on the game's thread with the player's update
-every 250 ms: the last one known, so it stays through loads and menus, and it is `null` until Link was first seen. `game`
+`map` is the game's own name for the map (`Sequence_CurrentBanc`), read on the game's thread with each of the player's
+updates: the last one known, so it stays through loads and menus, and it is `null` until Link was first seen. `game`
 (OoT, read with it) says whether an event is playing (a cutscene, a map change's), whether a map is loading
-(`Sequence_IsLoadingBanc`) and Link's age: `{"event":false,"loading":false,"age":"child"}`, `null` until then. A script
-that steps through places waits for `event` and `loading` to be false before its next step, instead of a log line.
+(`Sequence_IsLoadingBanc`) and Link's age, and `frame` is the game's presents (what the top-level `frame` counts) when the
+game read them: `{"event":false,"loading":false,"age":"child","frame":5320}`, `null` until then. The status gives the last
+state the game read, so a change shows once the game's next update has read it. A script that steps through places waits
+for `event` and `loading` to be false before its next step, instead of a log line.
 
 `state` is a guess from the draws a frame, the way test scripts read the log:
 
@@ -264,10 +266,10 @@ Teleport list asks for: the game takes it at the player's next update, in play, 
 The reply comes once the game took it (within `timeout`, default 10 s):
 
 - `"sent": true` and `map`, the map it goes to. `wait map` then tells when it arrived. `accepted` is the game's
-  event manager's own answer to the request: `false` was seen when the map then did not change (an arrival event of
-  the previous teleport still playing).
+  event manager's own answer to the request, `true` here: an answer of 0 is the refusal below.
 - `refused`, with the game's reason: an event playing (a cutscene, a map change's), a map loading, another teleport
-  in the last 8 s, or no map for Link's age there.
+  in the last 8 s, no map for Link's age there, or the event manager declined the request (its answer was 0). A
+  declined request is not counted in the 8 s, so the next one goes at once.
 - `timeout` when the game did not take it: Link is not being updated (the title, the file select, a pause, a load).
   The request is then withdrawn, so it does not happen later behind the client's back.
 - `cancelled` when a later `teleport` replaced it before the game took it (one waits at a time).
@@ -293,8 +295,8 @@ replaces one not taken yet (`cancelled`), and the replies are the teleport's:
   arrived. Not `wait map`: in a dungeon the map has the same name for both ages (`ForestTemple`), so a wait for it is met
   before the reload starts. `accepted` as for a teleport.
 - `"sent": false` when Link is that age already: nothing is done. The game checks the age asked for when it takes it, so
-  an old sample of Link's age in `status` (it is read every 250 ms, and not during a load) never flips him the wrong way.
-  With no `to`, the other age is decided from that sample.
+  an old age in `status` (the state the game read with each of the player's updates, and not during a load) never flips
+  him the wrong way. With no `to`, the other age is decided from that state.
 - `refused`, with the game's reason (as a teleport's, and Link's age not found or not written in the game's data);
   `timeout` when the game did not take it (not in play); `unavailable` before a save is loaded (the age is not known).
 
@@ -436,7 +438,7 @@ sets `XDG_DATA_HOME` for the run, so it plays from saves of its own. `--env NAME
   are not tested.
 - **The state is a guess** from the draws a frame (above). A scene with unusual counts can be misread; for OoT, `game`'s
   `event` and `loading` and `map` are the game's own.
-- **A teleport the game sent but that did not move Link**: `accepted` (the event manager's answer) is reported, not turned into an error: `false` was seen once, when the map did not change, but that it always means no move is not established. Otherwise `wait map` times out.
+- **A teleport the game sent but that did not move Link**: not turned into an error. `accepted` is `true` in every sent reply, since an answer of 0 from the event manager is `refused` instead. Otherwise `wait map` times out.
 - **The first `option_get` or `option_set`** after start can wait, on the bridge's thread, for the start-up check of
   the upscalers (NVIDIA's NGX start: about 3 s). The game does not wait for it; other replies to every client wait
   that long.

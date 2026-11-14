@@ -364,7 +364,6 @@ static struct {
     int64_t replayed;   /* the renderer's presents (shots count in these) */
     char map[80];       /* the map the game is in, the last one known ("" before any); map_changes: how often it changed */
     int map_changes;
-    int have_oot, oot_event, oot_loading, oot_child;   /* (with the map: hos_oot_state) */
     /* log lines for subscribers (any thread writes; the bridge's thread reads) */
     ctl_mutex log_mu;
     char log_ring[CTL_LOG_RING][400];
@@ -493,7 +492,6 @@ static void stats_tick(int64_t now) {
         memcpy(G.map, map, sizeof G.map);
         G.map_changes++;
     }
-    G.have_oot = G.game->oot_state && G.game->oot_state(&G.oot_event, &G.oot_loading, &G.oot_child);
     const int at = G.sample_at;
     G.samples[at].t = now, G.samples[at].frame = frame, G.samples[at].replayed = replayed, G.samples[at].draws = draws;
     G.sample_at = (at + 1) % 16;
@@ -900,9 +898,11 @@ static void cmd_status(int ci, const char *id) {
     buf_puts(&b, ",\"map\":");
     if (G.map[0]) buf_str(&b, G.map);
     else buf_puts(&b, "null");
-    if (G.have_oot)
-        buf_printf(&b, ",\"game\":{\"event\":%s,\"loading\":%s,\"age\":\"%s\"}", G.oot_event ? "true" : "false",
-                   G.oot_loading ? "true" : "false", G.oot_child ? "child" : "adult");
+    int event = 0, loading = 0, child = 0;
+    int64_t read_at = 0;
+    if (G.game->oot_state && G.game->oot_state(&event, &loading, &child, &read_at))
+        buf_printf(&b, ",\"game\":{\"event\":%s,\"loading\":%s,\"age\":\"%s\",\"frame\":%lld}",
+                   event ? "true" : "false", loading ? "true" : "false", child ? "child" : "adult", (long long)read_at);
     else buf_puts(&b, ",\"game\":null");
     buf_puts(&b, ",\"version\":");
     buf_str(&b, G.game->version ? G.game->version : "unknown");
@@ -1319,7 +1319,8 @@ static void cmd_age(int ci, const JDoc *d, int req, const char *id) {
     if (!G.game->age || !G.game->oot_state || !G.game->teleport_result)
         return reply_error(c, id, "unavailable", "this game has no age switch");
     int event = 0, loading = 0, child = 0;
-    if (!G.game->oot_state(&event, &loading, &child))
+    int64_t read_at = 0;
+    if (!G.game->oot_state(&event, &loading, &child, &read_at))
         return reply_error(c, id, "unavailable", "Link's age is not known yet: a save is loaded in play first");
     const JNode *to = j_get(d, req, "to");
     int adult_to = child;   /* (none: the other age) */
@@ -2320,7 +2321,7 @@ int hos_oot_teleport_ask(int index);
 int hos_oot_teleport_result(int ticket, char *why, size_t why_cap, char *map, size_t map_cap, int *accepted);
 void hos_oot_teleport_cancel(int ticket);
 int hos_oot_age_ask(int adult);
-int hos_oot_state(int *event, int *loading, int *child);
+int hos_oot_state(int *event, int *loading, int *child, int64_t *frame);
 static HosControlGame game = {
     .frame = game_frame, .frame_info = rx_control_frame_info, .shot = rx_control_shot, .setting = rx_control_setting,
     .setting_set = rx_control_setting_set, .mem_region = game_mem_region, .mem_read = game_mem_read,

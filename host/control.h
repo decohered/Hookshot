@@ -68,8 +68,9 @@ typedef struct HosControlGame {
        numbering (> 0), read with teleport_result (map: the map it reloads) and dropped with teleport_cancel; a later
        teleport or age ask replaces one not taken yet. 0: not asked */
     int (*age)(int adult);
-    /* (OoT) with the map: an event playing (a cutscene, a map change's), a map loading, Link the child. 0 before any */
-    int (*oot_state)(int *event, int *loading, int *child);
+    /* (OoT) with the map: an event playing (a cutscene, a map change's), a map loading, Link the child, and the frame (the
+       game's presents, as frame) it was read on. 0 before any */
+    int (*oot_state)(int *event, int *loading, int *child, int64_t *frame);
 } HosControlGame;
 
 /* Listens on path and serves on a thread of its own. 0 when it could not (logged) */

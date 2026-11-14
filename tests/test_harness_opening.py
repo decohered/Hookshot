@@ -142,8 +142,10 @@ def answer(req):
     if cmd == env.get("FAKE_REFUSE"):
         return {"ok": False, "error": "refused", "message": "%s refused by the stand-in" % cmd}
     if cmd == "status":
-        return {"ok": True, "frame": ticks[0], "replayed": ticks[0], "renderer": env["FAKE_RENDERER"],
-                "state": env["FAKE_STATE"], "map": "map_a", "game": {"event": False, "loading": False, "age": "child"}}
+        frame = ticks[0]
+        return {"ok": True, "frame": frame, "replayed": frame, "renderer": env["FAKE_RENDERER"],
+                "state": env["FAKE_STATE"], "map": "map_a",
+                "game": {"event": False, "loading": False, "age": "child", "frame": frame}}
     if cmd == "sequence":
         mode = env.get("FAKE_SLOT", "write")
         if mode == "write":

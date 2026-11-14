@@ -912,7 +912,7 @@ static struct {
     int64_t requested_at, check_at;
     unsigned destination;
     const char *why, *banc;   /* (the last call's: why it was not sent, the map it was sent to; the control bridge's reply) */
-    uint64_t result;          /* (and the event manager's answer to the request: 0 seen when the map did not change) */
+    uint64_t result;          /* (and the event manager's answer to the request: 0 when it declined the request) */
 } teleport;
 
 static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
@@ -1023,16 +1023,20 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
                     set_bool ? "the game data manager" : "the game's Bool setter");
         }
     }
-    teleport.requested_at = now;
-    teleport.check_at = now + 1500000000LL;
-    teleport.destination = index;
+    const int declined = ok && !result;   /* (the event manager's answer 0: it did not take the request) */
+    if (!declined) {   /* (a declined request starts no gap: the next one may go at once) */
+        teleport.requested_at = now;
+        teleport.check_at = now + 1500000000LL;
+        teleport.destination = index;
+    }
     hos_log("cheats: teleport %s to %s at %s (boot %s, event %s, starter %d): request %s, result %#llx",
             child ? "child" : "adult", banc, start, boot, event, with_starter, ok ? "sent" : "not built",
             (unsigned long long)result);
     teleport.result = result;
-    if (ok) teleport.banc = banc;
+    if (declined) teleport.why = "the game's event manager declined the request";
+    else if (ok) teleport.banc = banc;
     else teleport.why = "the game's event request could not be built";
-    return ok;   /* (sent; the request's own result is only logged) */
+    return ok && !declined;   /* (taken: the event manager's answer is teleport.result) */
 }
 
 /* Writes a GameData bool directly: GameDataMgr+32 is the (hash, index) table (+44 its size), the bools are 24-byte
@@ -1103,16 +1107,17 @@ static void oot_teleport_followup(Ctx *c) {
 }
 
 /* (hookshot) the control bridge (host/control.c): the map the game is in (Sequence_CurrentBanc), read on the game's thread
-   with the player's update every 250 ms and kept for the bridge's thread; the last one known (it stays through loads and
+   with each of the player's updates and kept for the bridge's thread; the last one known (it stays through loads and
    menus, where Link is not updated). And the debug teleport by destination, as the Cheats page asks for it: taken at the
    next update of the player, in play, and what came of it (sent, or refused and why) kept for the bridge's reply */
 static SRWLOCK oot_map_lock = SRWLOCK_INIT;
 static char oot_map[80];
 static int oot_flags = -1;   /* (1 an event playing, 2 a map loading, 4 the child; -1 not read yet) */
-static void oot_map_refresh(Ctx *c, int64_t now) {
-    static int64_t next;
-    if (now < next) return;
-    next = now + 250000000LL;
+static int64_t oot_flags_frame;   /* (the game's presents when oot_flags was read) */
+static void oot_map_refresh(Ctx *c) {
+    extern volatile int64_t hos_present_count;   /* (display.c: the game's presents) */
+    /* (read before the flags, so the flags are no older than the frame they go with) */
+    const int64_t frame = __atomic_load_n(&hos_present_count, __ATOMIC_RELAXED);
     char map[80];
     if (!oot_gamedata_string(c, 0x1d6189dau, map, sizeof map) || !map[0]) return;   /* Sequence_CurrentBanc */
     int loading = 0, child = 1;
@@ -1123,15 +1128,18 @@ static void oot_map_refresh(Ctx *c, int64_t now) {
     AcquireSRWLockExclusive(&oot_map_lock);
     memcpy(oot_map, map, sizeof oot_map);
     oot_flags = flags;
+    oot_flags_frame = frame;
     ReleaseSRWLockExclusive(&oot_map_lock);
 }
-/* (with the map) whether an event (a cutscene, a map change's) is playing, a map is loading, Link is the child: 0 before any */
-int hos_oot_state(int *event, int *loading, int *child) {
+/* (with the map) whether an event (a cutscene, a map change's) is playing, a map is loading, Link is the child, and the
+   frame they were read on: 0 before any */
+int hos_oot_state(int *event, int *loading, int *child, int64_t *frame) {
     AcquireSRWLockShared(&oot_map_lock);
     const int f = oot_flags;
+    const int64_t at = oot_flags_frame;
     ReleaseSRWLockShared(&oot_map_lock);
     if (f < 0) return 0;
-    *event = f & 1, *loading = (f >> 1) & 1, *child = (f >> 2) & 1;
+    *event = f & 1, *loading = (f >> 1) & 1, *child = (f >> 2) & 1, *frame = at;
     return 1;
 }
 int hos_oot_current_map(char *out, size_t cap) {
@@ -1306,7 +1314,7 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     oot_teleport_followup(c);
     oot_inventory_refresh(c, now);
     oot_player_speed(c, components);
-    oot_map_refresh(c, now);
+    oot_map_refresh(c);
     if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
         oot_inventory_edit(c, action);
     } else if (action == OOT_AGE_ACTION) {
