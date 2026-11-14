@@ -6,9 +6,15 @@ switches; the run is written with every fact key, the capture's hashes, counts, 
 present, and no capture byte; a failing verdict and a launch that fails each write their run, marked FAIL, and exit 1.
 The machine's GPU listing is a fixture. The journal is injected.
 
+With --scene, the in-job half plays a suite scene through hx_run.play, against a stand-in for game.start: the game starts
+with the scene's save, slot, recorder and switches, and the run records the scene, the suite's sha256, the window,
+and the seconds and frames played. --seconds S replaces the suite's seconds. A held-out or unknown scene exits 2 with
+no game started.
+
 python -I -B tests/test_harness_hx_capture.py
 """
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
@@ -23,11 +29,15 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 HX = ROOT / "scripts" / "harness" / "hx.py"
 sys.path.insert(0, str(ROOT / "scripts" / "harness"))
+import bridge
+import game
 import hx_capture
+import hx_run
 import hx_smoke
 import jobs
 import record
 import remote
+import scenes
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
 CLOSURE = "/nix/store/%s-hookshot-closure" % ("a" * 32)
@@ -75,6 +85,68 @@ enter_closure = "/example/enter-closure.sh"
 expect = "Example GPU One"
 env = { VK_ICD_FILENAMES = "/example/icd.json" }
 """
+
+# A suite with a scene of each kind, cache and motion, and a held-out scene and one that is not (scenes.parse requires it).
+SUITE_TOML = """[method]
+note = "stand-in"
+
+[scenes.town-night]
+kind = "dense"
+cache = "cold"
+motion = "still"
+save = "town"
+slot = "01"
+hour = 22
+route = [{ teleport = 0 }, { wait = 60 }]
+seconds = 2
+
+[scenes.market-walk]
+kind = "medium"
+cache = "warm"
+motion = "moving"
+save = "market"
+route = [{ age = "adult" }]
+inputs = "stick up 30"
+seconds = 1
+
+[scenes.plaza-load]
+kind = "load"
+cache = "cold"
+motion = "still"
+save = "town"
+route = [{ teleport = 0 }]
+load_to = "plaza"
+seconds = 1
+
+[scenes.plaza-cutscene]
+kind = "cutscene"
+cache = "cold"
+motion = "still"
+save = "town"
+route = []
+seconds = 1
+
+[scenes.long-soak]
+kind = "soak"
+cache = "warm"
+motion = "still"
+save = "market"
+route = []
+seconds = 1800
+
+[scenes.sealed-final]
+kind = "light"
+cache = "warm"
+motion = "still"
+save = "market"
+route = []
+seconds = 1
+held_out = true
+"""
+# What the stand-in play returns: the window's first status, its last, and the map it was held on.
+FIRST = {"renderer": RENDERER, "frame": 5, "replayed": 4}
+LAST = {"renderer": RENDERER, "frame": 125, "replayed": 124}
+MAP = "plaza"
 
 # The stand-in game's control bridge. It answers the four commands hx capture sends, and does what the renderer does:
 # with RX_CAPTURE set, the game's own process writes the recorder's calls.rxc and blobs/<sha256> when it exits (after a
@@ -302,6 +374,7 @@ class InJobTests(unittest.TestCase):
         self.assertIsInstance(doc["free_bytes_before"], int)
         self.assertGreater(doc["free_bytes_before"], 0)
         self.assertEqual(doc["verdict"], "pass")
+        self.assertNotIn("seconds", doc)
 
     def test_no_capture_byte_is_copied_into_the_run(self):
         self.assertEqual(self.run_job(), 0, self.output)
@@ -517,6 +590,243 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(status, 2)
         self.assertIn("40-hex commit", err.getvalue())
         self.start.assert_not_called()
+
+    def test_a_scene_job_carries_the_scene_and_the_root_and_no_frames(self):
+        with quiet():
+            status = hx_capture.main(["--device", DEVICE, "--scene", "town-night"])
+        self.assertEqual(status, 0)
+        _, job_id, argv = self.start.call_args.args
+        job = "/example/harness/jobs/%s" % job_id
+        capture = "/example/harness/results/captures/%s" % job_id
+        self.assertEqual(argv, [
+            ENTER, CLOSURE, "python", "-I", job + "/tools/scripts/harness/hx.py", "capture", "--in-job", job,
+            "--hold", "/example/hold-file", "--expect", EXPECT, "--device", DEVICE,
+            "--capture", capture, "--record", "/example/harness/results", "--build-folder",
+            "/example/harness/builds/latest", "--closure", CLOSURE, "--env", "VK_ICD_FILENAMES=%s" % ICD,
+            "--scene", "town-night", "--root", "/example/harness", "--seconds", "20",
+        ])
+
+    def test_a_scene_job_carries_the_given_seconds(self):
+        with quiet():
+            status = hx_capture.main(["--device", DEVICE, "--scene", "town-night", "--seconds", "45"])
+        self.assertEqual(status, 0)
+        _, _, argv = self.start.call_args.args
+        self.assertEqual(argv[-6:], ["--scene", "town-night", "--root", "/example/harness", "--seconds", "45"])
+
+    def test_a_scene_with_frames_exits_2_before_any_remote_call(self):
+        err = io.StringIO()
+        with quiet(), contextlib.redirect_stderr(err):
+            status = hx_capture.main(["--device", DEVICE, "--scene", "town-night", "--frames", "7"])
+        self.assertEqual(status, 2)
+        self.assertIn("--frames does not apply with --scene", err.getvalue())
+        self.remote.assert_not_called()
+        self.start.assert_not_called()
+
+    def test_seconds_without_a_scene_exits_2_before_any_remote_call(self):
+        err = io.StringIO()
+        with quiet(), contextlib.redirect_stderr(err):
+            status = hx_capture.main(["--device", DEVICE, "--seconds", "45"])
+        self.assertEqual(status, 2)
+        self.assertIn("--seconds does not apply without --scene", err.getvalue())
+        self.remote.assert_not_called()
+        self.start.assert_not_called()
+
+    def test_seconds_must_be_a_positive_whole_number(self):
+        for value in ("0", "1.5", "x"):
+            with self.subTest(value=value):
+                err = io.StringIO()
+                with quiet(), contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                    hx_capture.main(["--device", DEVICE, "--scene", "town-night", "--seconds", value])
+                self.assertIn("not a number of seconds", err.getvalue())
+                self.remote.assert_not_called()
+                self.start.assert_not_called()
+
+
+class SceneInJobTests(unittest.TestCase):
+    """The in-job half with --scene: game.start and hx_run.play are stand-ins, and the suite is a file under a harness root,
+    read as hx run reads it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        self.record = base / "results"
+        self.job = base / "jobs" / jobs.new_id("check")
+        self.capture = self.record / "captures" / self.job.name
+        self.hold = base / "hold-file"
+        self.build = base / "build"
+        self.root = base / "harness"
+        game_dir = self.job / "game"
+        for folder in (self.job / "run", game_dir, self.build, self.root / "scenes"):
+            folder.mkdir(parents=True)
+        (game_dir / "hookshot").write_bytes(HOOKSHOT)
+        (game_dir / "hookshot_vk.so").write_bytes(HOOKSHOT_VK)
+        (self.build / "build.txt").write_text(build_text(), encoding="utf-8")
+        self.suite_bytes = SUITE_TOML.encode("utf-8")
+        (self.root / "scenes" / "suite.toml").write_bytes(self.suite_bytes)
+        self.log_text = "fake game started\n"
+        self.launch_error = None
+        self.running = mock.Mock()
+        self.running.quit.return_value = 0
+        self.messages = []
+        self.output = ""
+        self.patch(mock.patch.object(hx_capture, "command_outputs", return_value=OUTPUTS))
+        self.patch(mock.patch.object(record, "write_journal", side_effect=self.messages.append))
+        self.start = self.patch(mock.patch.object(game, "start", side_effect=self.start_game))
+        self.play = self.patch(mock.patch.object(hx_run, "play", return_value=(FIRST, LAST, MAP)))
+
+    def patch(self, patcher):
+        started = patcher.start()
+        self.addCleanup(patcher.stop)
+        return started
+
+    def start_game(self, job, game_dir, device_env, **kwargs):
+        if self.launch_error is not None:
+            raise game.GameError(self.launch_error)
+        log = os.path.join(job, "run", "log.txt")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write(self.log_text)
+        self.running.log = log
+        return self.running
+
+    def run_scene(self, scene="town-night", expect=EXPECT, seconds=None):
+        argv = ["--in-job", str(self.job), "--hold", str(self.hold), "--expect", expect, "--device", DEVICE,
+                "--capture", str(self.capture), "--record", str(self.record), "--build-folder", str(self.build),
+                "--closure", CLOSURE, "--env", "VK_ICD_FILENAMES=%s" % ICD, "--scene", scene, "--root", str(self.root)]
+        if seconds is not None:
+            argv += ["--seconds", str(seconds)]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            status = hx_capture.main(argv)
+        self.output = out.getvalue()
+        return status
+
+    def run_dir(self):
+        return self.record / "runs" / "000001"
+
+    def manifest(self):
+        return record.read_manifest(self.record, "000001")[0]
+
+    def capture_json(self):
+        return json.loads((self.run_dir() / "files" / "capture.json").read_text(encoding="utf-8"))
+
+    def test_the_game_starts_with_the_scene_save_slot_recorder_and_switches_and_play_gets_the_scene(self):
+        self.assertEqual(self.run_scene(), 0, self.output)
+        args, kwargs = self.start.call_args
+        self.assertEqual(args, (str(self.job), str(self.job / "game"), {"VK_ICD_FILENAMES": ICD}))
+        self.assertEqual(kwargs["save"], str(self.root / "scenes" / "saves" / "town"))
+        self.assertEqual(kwargs["slot"], "01")
+        self.assertEqual(kwargs["extra"], {**hx_capture.SWITCHES, "RX_CAPTURE": str(self.capture),
+                                           "RX_VK_SHOTS": str(self.capture / "shots")})
+        self.play.assert_called_once()
+        running, scene, expect = self.play.call_args.args
+        self.assertIs(running, self.running)
+        self.assertEqual(scene.name, "town-night")
+        self.assertEqual(expect, EXPECT)
+        self.running.quit.assert_called_once_with(hx_run.QUIT_SECONDS)
+        self.assertEqual((self.run_dir() / "files" / "game.log").read_text(encoding="utf-8"), self.log_text)
+
+    def test_capture_json_holds_the_scene_suite_hash_window_frames_and_last_present(self):
+        self.assertEqual(self.run_scene(), 0, self.output)
+        doc = self.capture_json()
+        self.assertEqual(doc["scene"], "town-night")
+        self.assertEqual(doc["suite_sha256"], sha(self.suite_bytes))
+        self.assertEqual(doc["window"], {"first": FIRST["replayed"] + 1, "last": LAST["replayed"]})
+        self.assertEqual(doc["frames"], 120)
+        self.assertEqual(doc["seconds"], 2)
+        self.assertEqual(doc["presents"], LAST["frame"])
+        self.assertEqual(doc["build"], SHA)
+        self.assertEqual(doc["device"], DEVICE)
+        self.assertEqual(doc["verdict"], "pass")
+
+    def test_seconds_replace_the_scenes_seconds_and_play_gets_every_other_field_unchanged(self):
+        self.assertEqual(self.run_scene(seconds=45), 0, self.output)
+        _, scene, _ = self.play.call_args.args
+        suite = scenes.parse(self.suite_bytes, str(self.root / "scenes" / "suite.toml"))
+        self.assertEqual(scene, dataclasses.replace(scenes.select(suite, "town-night", False), seconds=45))
+
+    def test_capture_json_holds_the_given_seconds_and_that_many_seconds_of_frames(self):
+        self.assertEqual(self.run_scene(seconds=45), 0, self.output)
+        doc = self.capture_json()
+        self.assertEqual(doc["seconds"], 45)
+        self.assertEqual(doc["frames"], 45 * hx_run.FPS)
+
+    def test_a_play_error_writes_a_FAIL_run_with_no_window_and_exits_1(self):
+        self.play.side_effect = bridge.BridgeError("the window is not steady at frame 9: loading True")
+        self.assertEqual(self.run_scene(), 1, self.output)
+        self.assertIn("capture: FAIL", self.output)
+        doc = self.capture_json()
+        self.assertEqual(doc["verdict"], "FAIL: the window is not steady at frame 9: loading True")
+        self.assertIsNone(doc["window"])
+        self.assertIsNone(doc["presents"])
+        self.assertEqual(doc["scene"], "town-night")
+        self.running.quit.assert_called_once_with(hx_run.QUIT_SECONDS)
+        self.assertEqual(len(self.messages), 1)
+
+    def test_a_quit_error_after_the_window_writes_a_FAIL_run_that_keeps_the_window_and_exits_1(self):
+        self.running.quit.side_effect = game.GameError("the game did not quit in 60 s: killed")
+        self.assertEqual(self.run_scene(), 1, self.output)
+        doc = self.capture_json()
+        self.assertEqual(doc["verdict"], "FAIL: the game did not quit in 60 s: killed")
+        self.assertEqual(doc["window"], {"first": FIRST["replayed"] + 1, "last": LAST["replayed"]})
+        self.assertEqual(doc["presents"], LAST["frame"])
+
+    def test_a_game_log_that_shows_the_device_fallback_fails_the_run(self):
+        self.log_text = "fake game started\nrenderer %s\n" % hx_smoke.FALLBACK
+        self.assertEqual(self.run_scene(), 1, self.output)
+        self.assertEqual(self.capture_json()["verdict"],
+                         "FAIL: the log shows the renderer fell back to another GPU (%s)" % hx_smoke.FALLBACK)
+
+    def test_a_game_that_will_not_start_writes_a_FAIL_run_with_no_window_and_no_game_log(self):
+        self.launch_error = "the game would not start (no executable)"
+        self.assertEqual(self.run_scene(), 1, self.output)
+        self.assertEqual(sorted(self.manifest()["files"]), ["capture.json"])
+        doc = self.capture_json()
+        self.assertEqual(doc["verdict"], "FAIL: launch: the game would not start (no executable)")
+        self.assertIsNone(doc["window"])
+        self.assertIsNone(doc["presents"])
+        self.assertEqual(doc["frames"], 120)
+        self.play.assert_not_called()
+
+    def test_a_held_out_scene_exits_2_with_no_game_started_and_nothing_written(self):
+        self.assertEqual(self.run_scene("sealed-final"), 2, self.output)
+        self.assertIn("held out", self.output)
+        self.start.assert_not_called()
+        self.assertFalse(self.capture.exists())
+        self.assertFalse((self.record / "runs").exists())
+
+    def test_an_unknown_scene_exits_2_with_no_game_started_and_nothing_written(self):
+        self.assertEqual(self.run_scene("nope"), 2, self.output)
+        self.assertIn("no scene named 'nope'", self.output)
+        self.start.assert_not_called()
+        self.assertFalse(self.capture.exists())
+        self.assertFalse((self.record / "runs").exists())
+
+
+class InJobArgumentsTests(unittest.TestCase):
+    BASE = ["/example/job", "--hold", "/example/hold-file", "--expect", EXPECT, "--device", DEVICE,
+            "--capture", "/example/capture", "--record", "/example/record", "--build-folder", "/example/build",
+            "--closure", CLOSURE]
+
+    def test_a_run_takes_frames_or_a_scene_with_its_root_and_not_both_or_neither(self):
+        cases = (
+            (["--frames", "3"], True),
+            (["--scene", "town-night", "--root", "/example/harness"], True),
+            (["--frames", "3", "--scene", "town-night", "--root", "/example/harness"], False),
+            (["--scene", "town-night"], False),
+            (["--frames", "3", "--root", "/example/harness"], False),
+            (["--scene", "town-night", "--root", "/example/harness", "--seconds", "45"], True),
+            (["--scene", "town-night", "--root", "/example/harness", "--seconds", "0"], False),
+            (["--frames", "3", "--seconds", "45"], False),
+            ([], False),
+        )
+        for extra, accepted in cases:
+            with self.subTest(extra=extra):
+                if accepted:
+                    hx_capture.parse_in_job(self.BASE + extra)
+                else:
+                    with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                        hx_capture.parse_in_job(self.BASE + extra)
 
 
 if __name__ == "__main__":
