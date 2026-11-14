@@ -11,6 +11,7 @@
 #include "../gpu/vk/vk_api.h"
 #include "../gpu/vk/dlss_math.h"
 #include "control.h"
+#include "rx_capture.h"
 
 /* the WebGPU renderer (gpu/render, renamed) */
 int wgr_start(void *hwnd);
@@ -250,6 +251,15 @@ static const MkwVkHost vk_host = {
     host_romfs_dir, host_wide_menus, host_slept_ns, host_fps_timing, hos_prompts_live_parts, host_screen_size,
     hos_wide_cover,
 };
+/* the host the renderer is given: the recorder's, with RX_CAPTURE set (it reads the soft write watch's marks), vk_host
+   itself otherwise (host/rx_capture.h) */
+static const MkwVkHost *capture_host(void) {
+#if defined(A64_WRITE_TRACK) && !defined(__EMSCRIPTEN__)
+    return rx_capture_host(&vk_host, a64_dirty, A64_DIRTY_PAGES);
+#else
+    return rx_capture_host(&vk_host, NULL, 0);
+#endif
+}
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */
 static HMODULE vk_module;   /* (the last back end loaded: rx_close_asked) */
@@ -336,7 +346,7 @@ static const MkwVkRenderer *load_vulkan(const char *dll) {
         hos_log("rx: %s has no mkwvk_init: WebGPU", path);
         return NULL;
     }
-    const MkwVkRenderer *r = init(&vk_host);
+    const MkwVkRenderer *r = init(capture_host());
     if (!r) {
         hos_log("rx: mkwvk_init returned NULL: WebGPU");
         return NULL;
@@ -354,7 +364,7 @@ int rx_start(void *hwnd) {
         const char *dll = "hookshot_vk.dll";
         const MkwVkRenderer *r = load_vulkan(dll);
         if (r && r->start(hwnd)) {
-            vk = r;
+            vk = rx_capture_renderer(r);
             hos_log("rx: renderer: Vulkan (%s)", dll);
             flush_early();
             return 1;
