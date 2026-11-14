@@ -20,6 +20,8 @@ FIXTURE = r"""
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include "vk_census.h"
+namespace play_census = mkwvk::play_census;
 @TRANSLATE_WAIT_H@
 #define PROF_EXACT() ((void)0)
 #define PROF_HOT(x) ((void)0)
@@ -50,6 +52,7 @@ struct Program {
     std::atomic<bool> ready{false};
     bool failed = false, fallback = false, fallback_task = false;
     int layout = 1, fallback_topology = 0;
+    uint64_t key = 0, variant = 0;
     Stages stages{&ready, {}};
 };
 struct PipeEntry { std::atomic<bool> ready{false}; VkPipeline pipeline = 1; std::atomic<unsigned char> how{0}; };
@@ -181,7 +184,7 @@ def main():
         cpp, exe = Path(tmp) / "test.cpp", Path(tmp) / "test"
         cpp.write_text(fixture, encoding="utf-8")
         subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Wno-unused-variable",
-                        str(cpp), "-o", str(exe)], check=True, timeout=60)
+                        "-I" + str(args.source / "gpu/vk"), str(cpp), "-o", str(exe)], check=True, timeout=60)
         failed = False
         for mode, wait in [(m, w) for m in (None, "0", "1", "2") for w in (None, "8", "0", "8ms")]:
             env = os.environ.copy()

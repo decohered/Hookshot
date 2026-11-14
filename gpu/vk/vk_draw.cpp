@@ -47,6 +47,7 @@
 #include "vk_reactive.h"   // (the upscalers' reactive mask: the scene copied before its transparent draws)
 #include "vk_dump.h"
 #include "vk_gprof.h"
+#include "vk_census.h"
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_texture.h"
@@ -2213,6 +2214,38 @@ uint64_t pipeline_key(const Program& p, const NvnState& s, const Targets& at, Vk
     return key;
 }
 
+/// The fields pipeline_key bakes in, each in its census group, under the conditions it bakes them in (the census only reads
+/// these: a program's first pipeline stores them, and the later pipelines' differences from it are counted)
+static void pipeline_state(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo,
+                           uint64_t (&state)[play_census::kPipeStateCount]) {
+    const int n = std::min(at.n, 8);
+    uint64_t colour = mix(0, (uint64_t)n), vertex = 0, blend = 0, wm = 0, raster = 0;
+    if (!p.mesh && !p.fallback) {
+        const Shader::Info& vs = *vertex_info(p);
+        for (int i = 0; i < 16; i++)
+            if (vs.loads.Generic(i)) vertex = mix(vertex, (uint64_t)s.vattr[i] << 8 | (i < s.nvattr));
+        for (int i = 0; i < 16; i++) vertex = mix(vertex, (uint64_t)s.vstream[i].divisor);
+    }
+    for (int i = 0; i < n; i++) {
+        colour = mix(colour, (uint64_t)at.color_format[i]);
+        if (!dev.eds3_blend) {
+            uint64_t b;
+            std::memcpy(&b, &s.blend[i], 8);
+            blend = mix(blend, (s.color.blend_en >> i & 1) ? b : 0);
+            wm |= (uint64_t)target_write_mask(p, s, i) << (4 * i);
+        }
+    }
+    if (!dev.eds3_polygon) raster = mix(raster, (uint64_t)s.poly.mode);
+    if (!dev.eds3_clamp) raster = mix(raster, (uint64_t)s.depth_clamp);
+    state[play_census::kTopology] = mix(0, (uint64_t)topology_class(topo));
+    state[play_census::kMultisample] = mix((uint64_t)at.samples, dev.eds3_a2c ? 0 : (uint64_t)s.ms.a2c);
+    state[play_census::kVertexInput] = mix(0, vertex);
+    state[play_census::kColorFormats] = mix(0, colour);
+    state[play_census::kDepthFormat] = mix(0, (uint64_t)at.depth_format);
+    state[play_census::kBlend] = mix(blend, wm << 8 | (dev.eds3_blend ? 0 : s.color.blend_en));
+    state[play_census::kRaster] = mix(0, raster);
+}
+
 PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, const uint8_t color_types[8]) {
     // the key: what is baked into it (the rest is dynamic state)
     // (hookshot: and which variant: p.key is the same for all the variants of a program by its textures' types, and a draw of
@@ -2257,6 +2290,11 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     if (it != pipelines.end()) return remember(mine[key] = it->second.get());
     pcache_init();
     PipeEntry* e = pipelines.emplace(key, std::make_unique<PipeEntry>()).first->second.get();
+    if (play_census::on) {
+        uint64_t state[play_census::kPipeStateCount];
+        pipeline_state(p, s, at, topo, state);
+        play_census::pipeline_made(mix(p.key, p.variant), state);
+    }
     if (kept_ready_n.load(std::memory_order_acquire)) {   // (made at its program's create call: ready, as one the precompile built)
         VkPipeline kept = VK_NULL_HANDLE;
         {
@@ -3746,6 +3784,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                (void*)view, view ? "" : " (dummy)");
                 if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
+                if (play_census::on) play_census::frame_view((uint64_t)(uintptr_t)view);
                 dw().imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw().imgs[first];
@@ -3782,6 +3821,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 if (view && tex && d.is_written && (dump_on() || probe_on())) dump_written().push_back({tex, level});
                 if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)dw().imgs.size(), handle, view ? tex : nullptr);
                 if (!view && !dev.null_descriptor) view = VK_NULL_HANDLE;
+                if (play_census::on) play_census::frame_view((uint64_t)(uintptr_t)view);
                 dw().imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw().imgs[first];
@@ -3889,6 +3929,17 @@ int words_same_store(const VkWriteDescriptorSet& w, uint64_t* o, const uint64_t*
 
 bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program& p) {
     if (dw().writes.empty()) return true;
+    if (play_census::on) {
+        if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+            std::vector<uint64_t> set_words;
+            uint64_t contents = 0;
+            for (const VkWriteDescriptorSet& w : dw().writes) {
+                write_words(w, set_words);
+                for (const uint64_t v : set_words) contents = mix(contents, v);
+            }
+            play_census::frame_set(contents);
+        }
+    }
     // A failed sampler is retryable, but cannot be published to either descriptor path.
     // Check the entire array before updating the pushed-state cache or allocating a set.
     for (const auto& w : dw().writes)
@@ -3907,6 +3958,10 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
             {
                 FINE_SCOPE(FT_PUSHCALL);
                 vkCmdPushDescriptorSetKHR(cmd, bp, p.layout, 0, (uint32_t)dw().writes.size(), dw().writes.data());
+            }
+            if (play_census::on) {
+                if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS)
+                    play_census::push(play_census::kFull, (uint32_t)dw().writes.size(), (uint32_t)dw().writes.size());
             }
             ps.cmd = cmd, ps.layout = p.layout, ps.n = dw().writes.size();
             if (old_state) {
@@ -3944,12 +3999,24 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
             }
             FINE_SCOPE(FT_PUSHCALL);
             vkCmdPushDescriptorSetKHR(cmd, bp, p.layout, 0, (uint32_t)changed.size(), changed.data());
+            if (play_census::on) {
+                if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS)
+                    play_census::push(play_census::kDelta, (uint32_t)changed.size(), (uint32_t)dw().writes.size());
+            }
         } else {
             FINE_N(FC_PUSH_NONE, 1);
+            if (play_census::on) {
+                if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS)
+                    play_census::push(play_census::kNone, 0, (uint32_t)dw().writes.size());
+            }
         }
         return true;
     }
     ps.cmd = VK_NULL_HANDLE;   // (a set bound: what was pushed is not known to stay)
+    if (play_census::on) {
+        if (bp == VK_PIPELINE_BIND_POINT_GRAPHICS)
+            play_census::push(play_census::kPoolSet, (uint32_t)dw().writes.size(), (uint32_t)dw().writes.size());
+    }
     if (g_fine) {
         fine_n[FC_POOL_SETS]++;
         for (const VkWriteDescriptorSet& w : dw().writes) fine_n[FC_POOL_DESCS] += w.descriptorCount;
@@ -4367,6 +4434,7 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
                 pass().height == at.height;
     for (int i = 0; i < at.n && same; i++) same = pass().color[i] == at.color_view[i];
     if (same) return;
+    if (play_census::on) play_census::pass_cause(play_census::kTargetChange);
     end_pass(cmd);
     if (at.has_block_images) {
         full_barrier(cmd, "barrier (before BC slice loads)");
@@ -4846,6 +4914,7 @@ void clear_after_draws(VkCommandBuffer cmd) {
     if (logged++ < 6)
         logf("vk: a clear after %d draws of its pass (%ux%u, %d colour targets%s, last program %016llx): a pass of its own",
              pass().draws, pass().width, pass().height, pass().n, pass().depth ? " + depth" : "", (unsigned long long)pass().prog);
+    if (play_census::on) play_census::pass_cause(play_census::kClear);
     end_pass(cmd);
 }
 
@@ -4881,6 +4950,7 @@ void reactive_scene_draw(VkCommandBuffer cmd, const Program& p, const NvnState& 
                  reactive_policy::kCopies, (unsigned long long)now);
         return;
     }
+    if (play_census::on) play_census::pass_cause(play_census::kCopy);
     end_pass(cmd);   // (a copy cannot be made in a pass)
     reactive::copy_scene(cmd, at.color[0], at.color_level[0], at.color_layer[0], at.width, at.height);
 }
@@ -4933,6 +5003,7 @@ uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, 
     if (logged++ < 8)
         logf("vk: a draw (program %016llx) %s, after %d draws of the pass (%ux%u): a pass of its own", (unsigned long long)p.key,
              kind, pass().draws, pass().width, pass().height);
+    if (play_census::on) play_census::pass_cause(play_census::kHazard);
     end_pass(cmd);
     return writes;
 }
@@ -5317,6 +5388,7 @@ namespace {
 TLS_OBJECT(dump_mesh_indirect, std::vector<std::pair<uint64_t, uint64_t>>)   // (program key, indirect address)
 } // namespace
 void end_pass(VkCommandBuffer cmd) {
+    if (play_census::on) play_census::pass_end(pass().open);
     if (!pass().open) return;
     vkCmdEndRendering(cmd);
     pass().open = false;
@@ -6042,6 +6114,7 @@ struct StatsQuery {
 void StatsQuery::copy_watch(VkCommandBuffer cmd, uint32_t index) {
     const std::vector<uint64_t>& w = watch_addrs();
     if (w.empty() || !stats_watch) return;
+    if (play_census::on) play_census::pass_cause(play_census::kCopy);
     end_pass(cmd);
     VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -6070,6 +6143,7 @@ void StatsQuery::gpu_dump(VkCommandBuffer cmd, const NvnState& s, uint64_t prog,
             return;
         stats_gpu_map = (uint8_t*)m;
     }
+    if (play_census::on) play_census::pass_cause(play_census::kCopy);
     end_pass(cmd);
     VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -6104,6 +6178,7 @@ void StatsQuery::copy_args(VkCommandBuffer cmd, const DrawArgs& d, uint32_t inde
         const BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
         if (!args) return;
         stats_meta[index].args_vkbuf = (uint64_t)(uintptr_t)args.buffer, stats_meta[index].args_vkoff = args.offset;
+        if (play_census::on) play_census::pass_cause(play_census::kCopy);
         end_pass(cmd);
         VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
         mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -6170,6 +6245,7 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
         off = mesh_ring_at;
         mesh_ring_at += bytes;
     }
+    if (play_census::on) play_census::pass_cause(play_census::kCopy);
     end_pass(cmd);
     VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
     VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
@@ -6472,6 +6548,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     fallback_payload_address = f->payload_address;
     fallback_records_address = f->records_address;
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+    if (play_census::on) play_census::pass_cause(play_census::kCompute);
     end_pass(cmd);
     // (the shared pair: the last fallback draw on it, of any program of this thread, has read it before it is reset)
     full_barrier(cmd);
@@ -6714,6 +6791,7 @@ void mask_stabilize(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t 
     static VkImageView hist_view[2] = {};
     static uint32_t hist_w = 0, hist_h = 0, cur = 0;
     static uint64_t hist_frame = 0;
+    if (play_census::on) play_census::pass_cause(play_census::kCompute);
     end_pass(cmd); // History image transitions must be outside dynamic rendering.
     if (hist_w != w || hist_h != h) {
         for (int i = 0; i < 2; i++) {
@@ -7012,6 +7090,8 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
         const int64_t pipes_new = use_counters.pipes_new;
         pe = graphics_pipeline(p, s, at, topo, types);
+        if (play_census::on) play_census::program(p.key, p.variant);
+        if (play_census::on) play_census::frame_pipeline((uint64_t)(uintptr_t)pe);
         if (use.on) use.pipeline(pe->ready.load(std::memory_order_acquire), use_counters.pipes_new != pipes_new);
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
@@ -7140,6 +7220,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (!src) SKIP_HERE();
         if (mesh_args_ready()) {
             static const uint32_t word = getenv("RX_VK_MESH_COUNT_WORD") ? (uint32_t)atoi(getenv("RX_VK_MESH_COUNT_WORD")) : 0;
+            if (play_census::on) play_census::pass_cause(play_census::kCopy);
             end_pass(cmd);
             full_barrier(cmd);
             static thread_local std::vector<VkBufferCopy> copies;
@@ -7239,6 +7320,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             last_desc_destroy = desc_destroy_seen;
     } else {
         st_desc_reused++;
+        if (play_census::on) play_census::desc_reused();
     }
     {
         FINE_SCOPE(FT_PUSHC);
@@ -7714,6 +7796,7 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     if (!(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(fd.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
         !(fs.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT))
         return false;
+    if (play_census::on) play_census::pass_cause(play_census::kUpscale);
     end_pass(cmd);
     full_barrier(cmd);
     if (dst->format == VK_FORMAT_R8G8B8A8_UNORM && movie_upscale(cmd, in_h, out_h, dst)) {
@@ -7994,6 +8077,7 @@ bool temporal_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p)
 /// without this DLSS and FSR would only ever see the game's 3/4. True: FSR 3.1 or the temporal upscaler wrote the output
 static bool temporal_rejected_network(VkCommandBuffer cmd, uint64_t key, Texture* src, const nvn_tex* in, Texture* dst,
                                       const nvn_tex* out) {
+    if (play_census::on) play_census::pass_cause(play_census::kUpscale);
     end_pass(cmd);
     VkFormat in_format = VK_FORMAT_UNDEFINED, out_format = VK_FORMAT_UNDEFINED;
     const VkImageView in_view = texture_view(src, in, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample, &in_format);
@@ -9417,6 +9501,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     }
     if (plk.on) par_mutex().unlock(), plk.on = false;
     dclock.t_pipe = slow_dispatch_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (play_census::on) play_census::pass_cause(play_census::kCompute);
     end_pass(cmd);
     static const bool no_grid_patch = env_on("RX_VK_NO_GRID_PATCH");
     grid_patch_want = indirect && !no_grid_patch, grid_patch_at = UINT64_MAX;

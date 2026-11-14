@@ -33,6 +33,9 @@ PREFIX = r'''
 #include <string>
 #include <unordered_set>
 #include <vector>
+#include "vk_census.h"
+
+namespace play_census = mkwvk::play_census;
 
 // Only the Vulkan declarations used by upscale_stub; no Vulkan SDK or runtime.
 using VkCommandBuffer = uintptr_t;
@@ -269,11 +272,11 @@ def main():
         exe = tmp / ('check.exe' if os.name == 'nt' else 'check')
         source.write_text(PREFIX + body + SUFFIX, encoding='utf-8')
         if Path(args.cxx).name.lower() in ('cl', 'cl.exe', 'clang-cl', 'clang-cl.exe'):
-            command = [args.cxx, '/nologo', '/std:c++20', "/FI" + ENV_ON_H, '/EHsc', '/UNDEBUG', str(source),
+            command = [args.cxx, '/nologo', '/std:c++20', "/FI" + ENV_ON_H, "/I" + str(ROOT / 'gpu' / 'vk'), '/EHsc', '/UNDEBUG', str(source),
                        '/Fo' + str(tmp / 'check.obj'), '/Fe' + str(exe)]
             cwd = tmp
         else:
-            command = [args.cxx, '-std=c++20', '-include', ENV_ON_H, '-UNDEBUG', str(source), '-o', str(exe)]
+            command = [args.cxx, '-std=c++20', '-include', ENV_ON_H, '-I' + str(ROOT / 'gpu' / 'vk'), '-UNDEBUG', str(source), '-o', str(exe)]
             cwd = None
         subprocess.run(command, cwd=cwd, env=env, check=True)
         cases = ('captured', 'r11', 'movie', 'view', 'skip', 'mip', 'swizzle', 'fd', 'fd-r11',

@@ -13,6 +13,8 @@
 #include <mutex>
 #include <utility>
 #include <vector>
+#include "vk_census.h"
+namespace play_census = mkwvk::play_census;   // (the cut code below sits outside namespace mkwvk)
 using VmaAllocation = void*;
 struct { VkDevice device{}; VkQueue queue{}; std::mutex present_mu; } dev;
 VkSemaphore timeline = reinterpret_cast<VkSemaphore>(uintptr_t(1));

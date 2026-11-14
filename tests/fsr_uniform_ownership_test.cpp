@@ -20,6 +20,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include "vk_census.h"
+namespace play_census = mkwvk::play_census;   // (the cut code below sits outside namespace mkwvk)
 static void require(bool ok,const char* why) { if(!ok) { std::fprintf(stderr,"FAIL: %s\n",why); std::exit(1); } }
 struct Allocation { std::vector<uint8_t> cpu,visible; };
 using VmaAllocation=Allocation*;

@@ -17,6 +17,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "vk_census.h"
+
+namespace play_census = mkwvk::play_census;
 
 namespace fixture {
 enum Cache { None = -1, Owner, Seen, Mine, Failure };

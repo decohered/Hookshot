@@ -49,6 +49,7 @@
 #include "vk_xfer.h"
 #include "vk_present_rect.h"
 #include "vk_present_trace.h"
+#include "vk_census.h"
 
 #include "vk_internal.h"
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
@@ -411,6 +412,7 @@ Recording& begin_recording(uint64_t value) {
     r.part = ++rec_part_next;
     memory_recording_part(r.part);
     memory_recording_value(value, completed());
+    if (play_census::on) play_census::recording_value(value);
     texture_begin_recording(r.upload, value);
     draw_begin_recording(r.slot, r.cmd, value);
     return r;
@@ -871,6 +873,26 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         std::memcpy(&h, p, sizeof h);
         const uint8_t* a = p + 8;
         const uint32_t avail = h.size - 8;
+        if (play_census::on) {
+            if (h.op == NOP_BEGIN) play_census::recording_begin(dry);
+            else if (h.op == NOP_DRAW || h.op == NOP_DRAW_IDX || h.op == NOP_DRAW_INDIRECT) play_census::draw(false, dry);
+            else if (h.op == NOP_DRAW_MESH) play_census::draw(true, dry);
+            else if (h.op == NOP_BARRIER) play_census::nvn_barrier(dry);
+            else if (h.op == NOP_UPDATE_UB) play_census::uniform_update(dry);
+            else if (h.op == NOP_BIND_PROGRAM) play_census::state_set(play_census::kProgram, dry);
+            else if (h.op == NOP_SET_RT) play_census::state_set(play_census::kTargets, dry);
+            else if (h.op == NOP_BIND_STATE || h.op == NOP_STENCIL || h.op == NOP_POLY_OFFSET || h.op == NOP_BLEND_COLOR ||
+                     h.op == NOP_PRIMITIVE_RESTART || h.op == NOP_DEPTH_CLAMP || h.op == NOP_RASTER_DISCARD)
+                play_census::state_set(play_census::kRenderState, dry);
+            else if (h.op == NOP_BIND_VATTR || h.op == NOP_BIND_VSTREAM || h.op == NOP_BIND_VBUF)
+                play_census::state_set(play_census::kVertex, dry);
+            else if (h.op == NOP_VIEWPORTS || h.op == NOP_SCISSOR || h.op == NOP_DEPTH_RANGE)
+                play_census::state_set(play_census::kViewport, dry);
+            else if (h.op == NOP_BIND_BUFS || h.op == NOP_BIND_UBO || h.op == NOP_BIND_SSBO || h.op == NOP_BIND_TEX ||
+                     h.op == NOP_BIND_SAMP || h.op == NOP_BIND_IMG || h.op == NOP_SET_TEX_POOL || h.op == NOP_SET_SAMP_POOL ||
+                     h.op == NOP_PUSH_CONST)
+                play_census::state_set(play_census::kBindings, dry);
+        }
         switch (h.op) {
         case NOP_END: return;
         case NOP_BEGIN: case NOP_JUMP: case NOP_CALL: break;
@@ -892,6 +914,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 host->gpu_read(e.gpu, &old, 4);
                 v = old + e.value;
             }
+            if (play_census::on) play_census::pass_cause(play_census::kEvent);
             end_pass(cmd);
             GprofSpan gp(cmd, "event signal (barrier, write, barrier)");
             full_barrier(cmd);
@@ -982,6 +1005,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                          (unsigned long long)c.dst, (unsigned long long)c.size, src ? "bound" : "NOT bound",
                          dst ? "bound" : "NOT bound (on the CPU)");
             }
+            if (play_census::on) play_census::pass_cause(play_census::kCopy);
             end_pass(cmd);
             GprofSpan gp(cmd, "copy buffer->buffer (with its barriers)");
             gp.bytes = c.size;
@@ -1028,6 +1052,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                     logf("vk: watch range buffer clear %#llx (%#llx bytes) to %#x: %s", (unsigned long long)c.dst,
                          (unsigned long long)c.size, (unsigned)c.value, dst ? "on the GPU" : "NOT bound");
             }
+            if (play_census::on) play_census::pass_cause(play_census::kClear);
             end_pass(cmd);
             GprofSpan gp(cmd, "clear buffer (with its barriers)");
             gp.bytes = c.size;
@@ -1048,10 +1073,34 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             full_barrier(cmd);
             break;
         }
-        case NOP_COPY_B2T: if (!dry) { ParLock lk; copy_b2t(cmd, s, payload<nvn_p_copy_bt>(a, avail), true); } break;
-        case NOP_COPY_T2B: if (!dry) { ParLock lk; copy_b2t(cmd, s, payload<nvn_p_copy_bt>(a, avail), false); } break;
-        case NOP_COPY_T2T: if (!dry) { ParLock lk; copy_t2t(cmd, s, payload<nvn_p_copy_tt>(a, avail)); } break;
-        case NOP_CLEAR_TEX: if (!dry) { ParLock lk; clear_tex(cmd, s, payload<nvn_p_clear_tex>(a, avail)); } break;
+        case NOP_COPY_B2T:
+            if (!dry) {
+                ParLock lk;
+                if (play_census::on) play_census::pass_cause(play_census::kCopy);
+                copy_b2t(cmd, s, payload<nvn_p_copy_bt>(a, avail), true);
+            }
+            break;
+        case NOP_COPY_T2B:
+            if (!dry) {
+                ParLock lk;
+                if (play_census::on) play_census::pass_cause(play_census::kCopy);
+                copy_b2t(cmd, s, payload<nvn_p_copy_bt>(a, avail), false);
+            }
+            break;
+        case NOP_COPY_T2T:
+            if (!dry) {
+                ParLock lk;
+                if (play_census::on) play_census::pass_cause(play_census::kCopy);
+                copy_t2t(cmd, s, payload<nvn_p_copy_tt>(a, avail));
+            }
+            break;
+        case NOP_CLEAR_TEX:
+            if (!dry) {
+                ParLock lk;
+                if (play_census::on) play_census::pass_cause(play_census::kClear);
+                clear_tex(cmd, s, payload<nvn_p_clear_tex>(a, avail));
+            }
+            break;
         case NOP_UPDATE_UB: {
             const auto u = payload<nvn_p_update_ub>(a, avail);
             if (worker) {   // (appended by the dry pass: the draws after it read it from here on)
@@ -1096,7 +1145,10 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             const auto b = payload<nvn_p_bind_program>(a, avail);
             // (the same program bound again: its descriptors already stand)
             const bool same = b.prog && s.has_prog ? std::memcmp(&s.prog, b.prog, sizeof s.prog) == 0 : !b.prog && !s.has_prog;
-            if (!same) s.bind_gen++, st_bg_prog++;
+            if (!same) {
+                s.bind_gen++, st_bg_prog++;
+                if (play_census::on) play_census::slot_changed(dry);
+            }
             if (b.prog) s.prog = *b.prog;
             s.has_prog = b.prog != nullptr && b.prog->nstage > 0;
             break;
@@ -1175,6 +1227,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 nvn_p_bind_buf& u = (b.ssbo ? s.ssbo : s.ubo)[b.stage][index];
                 if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, index, b.r[i].address, b.r[i].size)) {
                     s.bind_gen++, st_bg_bufs++;
+                    if (play_census::on) play_census::slot_changed(dry);
                     if (b.ssbo) s.ssbo_gen[b.stage] = s.bind_gen;
                 }
                 u.stage = b.stage, u.index = index, u.addr = b.r[i].address, u.size = b.r[i].size;
@@ -1195,6 +1248,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 nvn_p_bind_buf& u = (h.op == NOP_BIND_UBO ? s.ubo : s.ssbo)[b.stage][b.index];
                 if (!buf_unchanged(u.stage, u.index, u.addr, u.size, b.stage, b.index, b.addr, b.size)) {
                     s.bind_gen++;
+                    if (play_census::on) play_census::slot_changed(dry);
                     (h.op == NOP_BIND_UBO ? st_bg_ubo : st_bg_ssbo)++;
                     if (h.op == NOP_BIND_SSBO) s.ssbo_gen[b.stage] = s.bind_gen;
                 }
@@ -1219,6 +1273,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             while (n < b.n && b.first + n < lim) n++;
             if (!handles_unchanged(to + b.first, b.h, n)) {   // (the same handles: the draw keeps its descriptors)
                 s.bind_gen++;
+                if (play_census::on) play_census::slot_changed(dry);
                 (h.op == NOP_BIND_TEX ? st_bg_tex : h.op == NOP_BIND_SAMP ? st_bg_samp : st_bg_img)++;
                 s.tex_gen[b.stage] = s.bind_gen;
             }
@@ -1280,6 +1335,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         case NOP_SET_TEX_POOL: case NOP_SET_SAMP_POOL:
             s.bind_gen++;
+            if (play_census::on) play_census::slot_changed(dry);
             for (int k = 0; k < kNvnStages; k++) s.tex_gen[k] = s.bind_gen;
             break;
         case NOP_COPY_STRIDE: s.copy_stride = payload<nvn_p_copy_stride>(a, avail).stride; break;
@@ -1290,7 +1346,10 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 const bool same = (uint64_t)u.offset + u.size <= s.cs_push_n && std::memcmp(s.cs_push + u.offset, src, u.size) == 0;
                 std::memcpy(s.cs_push + u.offset, src, u.size);
                 s.cs_push_n = std::max<uint32_t>(s.cs_push_n, u.offset + u.size);
-                if (!same) s.bind_gen++;
+                if (!same) {
+                    s.bind_gen++;
+                    if (play_census::on) play_census::slot_changed(dry);
+                }
             }
             break;
         }
@@ -1301,6 +1360,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 std::lock_guard lk(st_barrier_flags_mu);
                 st_barrier_flags[bits]++;
             }
+            if (play_census::on) play_census::pass_cause(play_census::kBarrier);
             end_pass(cmd);
             full_barrier(cmd, "barrier (the game's nvnCommandBufferBarrier)");
             st_barriers++;
@@ -1425,6 +1485,7 @@ thread_local bool split_off = false;
 void maybe_split(VkCommandBuffer& cmd) {
     static const int64_t every = getenv("RX_VK_CHUNK") ? atoll(getenv("RX_VK_CHUNK")) : 120;
     if (split_off || !rec_cur || every <= 0 || ++part_work < every || rec_parts + 1 >= kMaxParts || dump_on()) return;
+    if (play_census::on) play_census::pass_cause(play_census::kSplit);
     end_pass(cmd);
     // (a part's end does not write the stream's uniform updates recorded so far into guest memory, nor start a new window
     // of them: the submission's last part writes them all, as an unsplit submission does (finish_recording). Written at
@@ -1519,6 +1580,7 @@ void record_segment(VkCommandBuffer& cmd, const Segment& g) {
     ub_gen++;
     full_barrier(cmd);   // (after what the command buffers before it did)
     replay(cmd, s, g.p, g.end);
+    if (play_census::on) play_census::pass_cause(play_census::kSplit);
     end_pass(cmd);
     full_barrier(cmd);
     rmode = Mode::Serial;
@@ -1625,6 +1687,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     // what came before, to the GPU now (its uploads included); then each segment into a recording of its own (its
     // command buffer and uploads), recorded in order by the threads and submitted in order as they are done
     Recording& r = *rec_cur;
+    if (play_census::on) play_census::pass_cause(play_census::kSplit);
     end_pass(r.cmd);
     full_barrier(r.cmd);
     memory_sync_mirrors_before_segments();   // (in r's uploads, ahead of every segment)
@@ -1795,6 +1858,7 @@ void bench_replay(const std::vector<uint64_t>& handles) {
         if (h) replay(cmd, *cur_state, reinterpret_cast<const uint8_t*>(h));
     Recording& r = *rec_cur;
     rec_cur = nullptr;
+    if (play_census::on) play_census::pass_cause(play_census::kRecordingEnd);
     end_pass(r.cmd);
     flush_ub_updates(r.cmd);
     memory_end_submission(r.cmd, r.part);
@@ -2066,6 +2130,7 @@ void finish_recording(uint64_t value) {
     (void)value;
     Recording& r = *rec_cur;
     rec_cur = nullptr;
+    if (play_census::on) play_census::pass_cause(play_census::kRecordingEnd);
     end_pass(r.cmd);
     flush_ub_updates(r.cmd);
     memory_end_submission(r.cmd, r.part);
@@ -2131,6 +2196,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         submit_memory_work(value);
     }
     if (burst_open && rec_cur) {   // (the burst's recording goes on: what the piece before did, done first)
+        if (play_census::on) play_census::pass_cause(play_census::kSubmit);
         end_pass(rec_cur->cmd);
         full_barrier(rec_cur->cmd, "barrier (a burst's next submit start)");
         use_queue_state(queue);
@@ -2475,10 +2541,15 @@ int wait(uint64_t f, uint64_t timeout_ns) {
 }
 void wait_queue_empty();
 bool replay_behind();
+// (the census's lines: vk_census.h passes each one here, to the play log)
+void census_line(const char* line) {
+    logf("%s", line);
+}
 void finish() {
     FpsWait fw(fps_stats::kGpuWait);   // (the FPS counter's Breakdown)
     wait_queue_empty();
     wait_value(pushed.load());
+    if (play_census::on) play_census::flush(census_line);
 }
 void wait_writebacks_reading(const void*, uint64_t) {}   // (nothing to write back: the GPU writes guest memory)
 /// (host: the CPU is about to read [gpu, gpu + size), nvnMemoryPoolInvalidateMappedRange / nvnBufferInvalidateMappedRange)
@@ -2624,6 +2695,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
             static const bool by_part = !getenv("RX_VK_READBACK_PART") || atoi(getenv("RX_VK_READBACK_PART")) != 0;
             uint64_t part = 0, whole = 0;
             const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr, &part, &whole);
+            if (play_census::on) play_census::readback(v);
             static const bool log_each = env_on("RX_VK_LOG_READBACK_WAITS");
             uint64_t l_part = 0, l_last = 0, l_sent = 0, l_done = 0;   // (the log's: recordings, on their timeline)
             if (log_each && v > completed() && rec_timeline) {
@@ -3136,6 +3208,11 @@ void log_frame_stats() {
     log_slow_frame();
     made_ring[presents % 32] = texture_made();
     made_ring_present = presents;
+    if (play_census::on) {
+        int64_t made = 0, left = 0;
+        barrier_stats(&made, &left);
+        play_census::present(made, left, census_line);
+    }
     if (presents % 600 == 0) programs_census_log("play");
     if (++fps_n == 120) {
         const auto now = std::chrono::steady_clock::now();
