@@ -1,7 +1,8 @@
 """hx build <rev>: builds a revision on the build host. This checkout's devenv closure and the revision's source go to the host,
 make_game.py runs inside the closure as a build job, and then the closure, the full commit id, this checkout's dirty diff
 and the built binaries' sha256 hashes are printed. The same record is kept beside the build on the host (build.txt, and
-dirty.diff when the checkout is dirty), and builds/latest points at the build.
+dirty.diff when the checkout is dirty), and builds/latest points at the build. make_game's console output goes to the
+build's console.log on the host, and a failed build prints that log's last lines.
 """
 import hashlib
 import os
@@ -33,10 +34,15 @@ def resolve(rev):
 
 
 def devenv_closure():
-    """This checkout's devenv closure: devenv shell makes .devenv/gc/shell, a link to the store path it is"""
-    status = subprocess.run(["devenv", "shell", "--", "true"], cwd=str(jobs.CHECKOUT), stdout=sys.stderr).returncode
-    if status:
-        raise BuildError("devenv shell -- true failed with status %d" % status)
+    """This checkout's devenv closure: devenv shell makes .devenv/gc/shell, a link to the store path it is. devenv's output
+    is printed only when devenv shell -- true fails."""
+    proc = subprocess.run(["devenv", "shell", "--", "true"], cwd=str(jobs.CHECKOUT), stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT)
+    if proc.returncode:
+        sys.stderr.flush()
+        sys.stderr.buffer.write(proc.stdout)
+        sys.stderr.buffer.flush()
+        raise BuildError("devenv shell -- true failed with status %d" % proc.returncode)
     link = os.path.join(str(jobs.CHECKOUT), ".devenv", "gc", "shell")
     closure = os.path.realpath(link)
     if os.path.dirname(closure) != STORE:
@@ -63,10 +69,12 @@ def unpack(cfg, sha, bd):
 
 def start_build(cfg, job_id, closure, bd):
     """Starts make_game.py as a job, through the closure's entry script. The job first removes the build folder's earlier
-    build.txt and dirty.diff, so the folder holds the record of the build that last succeeded there, or none. A start that
-    is refused runs nothing and removes nothing."""
+    build.txt, dirty.diff and console.log, so the folder holds the record of the build that last succeeded there, or none.
+    make_game's stdout and stderr go to console.log. A start that is refused runs nothing and removes nothing."""
+    console = posixpath.join(bd, "console.log")
     records = [posixpath.join(bd, name) for name in ("build.txt", "dirty.diff")]
-    argv = ["sh", "-c", 'rm -f -- "$1" "$2" && shift 2 && exec "$@"', "hx-build"] + records + [
+    script = 'c=$1 && rm -f -- "$c" "$2" "$3" && shift 3 && exec "$@" >"$c" 2>&1'
+    argv = ["sh", "-c", script, "hx-build", console] + records + [
         cfg.enter_closure, closure, "python", "-I", posixpath.join(bd, "src", "nx2", "make_game.py"),
         "--nup", cfg.dump, "--out", posixpath.join(bd, "game"), "--log", posixpath.join(bd, "build.log")]
     jobs.start(cfg, job_id, argv, env={"XDG_CACHE_HOME": posixpath.join(cfg.root, "cache"),
@@ -112,7 +120,12 @@ def build(cfg, sha):
         print("ssh lost: the build goes on as %s (build folder %s)" % (jobs.unit(job_id), bd))
         return 255
     if status:
-        print("build failed: exit status %d; log: %s" % (status, posixpath.join(bd, "build.log")))
+        console = posixpath.join(bd, "console.log")
+        print("build failed: exit status %d; log: %s" % (status, console))
+        tail = remote.run(cfg.host, "tail -n 20 %s\n" % q(console), check=False)
+        sys.stdout.write(tail.stdout)
+        if tail.returncode:
+            print("hx build: could not read %s: %s" % (console, tail.stderr.strip()), file=sys.stderr)
         return status
     digests = binary_hashes(cfg, bd)
     dirty = hashlib.sha256(diff).hexdigest() if diff else "none"

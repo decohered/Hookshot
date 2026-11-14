@@ -4,9 +4,13 @@ environment and its output in output.log, and systemctl answers from files the t
 and that the argv runs with its environment, its output and its status (R2); the hold refused before the folder is made
 and when it appears while the folder is made, and wait_hold (R3); a bench refused beside any other job and a check
 beside a check (R4); separate folders, saves and game copies for two jobs of one build (R5); a start waiting for the
-start lock; follow's output, status and a lost ssh; and the job id, the quoting and an empty command. hx smoke (SmokeTests): its refusals, the job it starts (argv, game
-folder, device env) and the verdict of the in-job half against a stand-in game (R6), and its hold (R3). Nothing reaches a
-real host or a systemd user manager.
+start lock; follow's output, status and a lost ssh; and the job id, the quoting and an empty command. The job's end
+(DL60): its game folder removed, its exit file written after that, its exclusive size kept as its kind's last size
+(every kind, a size btrfs cannot measure left as it was), a failed removal reported in its output with its status
+kept, and a start under twice that size refused with its own status, under the start lock and before its folder is
+made. hx smoke
+(SmokeTests): its refusals, the job it starts (argv, game folder, device env) and the verdict of the in-job half against
+a stand-in game (R6), and its hold (R3). Nothing reaches a real host or a systemd user manager.
 
 python -I -B tests/test_harness_jobs.py
 """
@@ -59,9 +63,14 @@ exec sh -c "$4"
 # variables, its --working-directory and its --property outputs (append: files), then returns 0, as the real one returns
 # once the unit has started. systemctl list-units prints $FAKE_UNITS. is-active answers one step of $FAKE_STEPS per call:
 # "inactive" (exit 3), or "active:TEXT", which appends TEXT and a newline to $FAKE_GROW and answers active (exit 0).
+# btrfs filesystem du -s --raw prints the Exclusive bytes $FAKE_BTRFS_EXCL, with a Total 4096 more (or fails when
+# $FAKE_BTRFS_FAIL is set); df --output=avail -B1 prints $FAKE_AVAIL; rm -rf -- PATH records, with the call, whether the
+# exit file beside PATH exists yet and the text of PATH's marker file (when it has one), then removes PATH (or fails
+# when $FAKE_RM_FAIL is set, removing nothing).
 FAKE_TOOLS = r'''
 import json
 import os
+import shutil
 import subprocess
 import sys
 
@@ -153,7 +162,48 @@ def systemctl(args):
     fail("verb not faked: %s" % verb)
 
 
-tools = {"systemd-run": systemd_run, "systemctl": systemctl}
+def btrfs(args):
+    record("btrfs", args)
+    if os.environ.get("FAKE_BTRFS_FAIL"):
+        fail("ERROR: not a btrfs filesystem")
+    if len(args) != 5 or args[:4] != ["filesystem", "du", "-s", "--raw"]:
+        fail("want filesystem du -s --raw <path>, got: %s" % " ".join(args))
+    exclusive = int(os.environ["FAKE_BTRFS_EXCL"])
+    print("     Total   Exclusive  Set shared  Filename")
+    print("%12d %12d %12d  %s" % (exclusive + 4096, exclusive, 4096, args[4]))
+    return 0
+
+
+def df(args):
+    record("df", args)
+    if len(args) != 3 or args[:2] != ["--output=avail", "-B1"]:
+        fail("want --output=avail -B1 <path>, got: %s" % " ".join(args))
+    print("     Avail")
+    print(os.environ["FAKE_AVAIL"])
+    return 0
+
+
+def rm(args):
+    if len(args) != 3 or args[:2] != ["-rf", "--"]:
+        fail("want rm -rf -- <path>, got: %s" % " ".join(args))
+    path = args[2]
+    exit_file = os.path.join(os.path.dirname(path), "exit")
+    marker = os.path.join(path, "marker")
+    extra = []
+    if os.path.isfile(marker):
+        with open(marker, encoding="utf-8") as f:
+            extra.append("marker=%s" % f.read().strip())
+    record("rm", args + ["exit-present=%s" % os.path.exists(exit_file)] + extra)
+    if os.environ.get("FAKE_RM_FAIL"):
+        fail("cannot remove %s: Permission denied" % path)
+    if os.path.isdir(path) and not os.path.islink(path):
+        shutil.rmtree(path)
+    elif os.path.lexists(path):
+        os.remove(path)
+    return 0
+
+
+tools = {"systemd-run": systemd_run, "systemctl": systemctl, "btrfs": btrfs, "df": df, "rm": rm}
 sys.exit(tools[sys.argv[1]](sys.argv[2:]))
 '''
 
@@ -184,7 +234,10 @@ class JobTests(unittest.TestCase):
         fakes.write_text(FAKE_TOOLS, encoding="utf-8")
         scripts = {"ssh": FAKE_SSH,
                    "systemd-run": shim(sys.executable, fakes, "systemd-run"),
-                   "systemctl": shim(sys.executable, fakes, "systemctl")}
+                   "systemctl": shim(sys.executable, fakes, "systemctl"),
+                   "btrfs": shim(sys.executable, fakes, "btrfs"),
+                   "df": shim(sys.executable, fakes, "df"),
+                   "rm": shim(sys.executable, fakes, "rm")}
         for name, body in scripts.items():
             fake = bin_dir / name
             fake.write_text(body, encoding="utf-8")
@@ -207,10 +260,12 @@ class JobTests(unittest.TestCase):
             "FAKE_UNITS": str(self.units_file),
             "FAKE_STEPS": str(self.steps),
             "FAKE_GROW": str(self.grow),
+            "FAKE_BTRFS_EXCL": "4096",
+            "FAKE_AVAIL": "1000000000000",
         })
         env.start()
         self.addCleanup(env.stop)
-        for var in ("FAKE_SSH_REFUSE", "FAKE_HOLD_ON_LIST"):
+        for var in ("FAKE_SSH_REFUSE", "FAKE_HOLD_ON_LIST", "FAKE_BTRFS_FAIL", "FAKE_RM_FAIL"):
             os.environ.pop(var, None)
         self.cfg = config.load(self.conf)
 
@@ -222,6 +277,18 @@ class JobTests(unittest.TestCase):
             return []
         entries = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
         return [entry[1:] for entry in entries if entry[0] == tool]
+
+    def events(self):
+        if not self.log.exists():
+            return []
+        return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+
+    def size_file(self, kind):
+        return Path(self.root, "jobs", kind + ".size")
+
+    def set_size(self, kind, text):
+        self.size_file(kind).parent.mkdir(parents=True, exist_ok=True)
+        self.size_file(kind).write_text(text, encoding="utf-8")
 
     def run_start(self, job_id, argv, env=None, game=None):
         script = jobs.start_script(self.cfg, job_id, argv, env, game)
@@ -417,8 +484,9 @@ class JobTests(unittest.TestCase):
     def test_r5_two_jobs_of_one_build_keep_their_own_saves_and_game_copies(self):
         game = self.build("abc1234", {"hookshot": "exe\n", "hookshot_options.ini": "build\n"})
         first, second = jobs.new_id("check"), jobs.new_id("check")
+        # the job's game copy is removed when it ends (DL60), so the command keeps what it wrote in its saves folder
         script = ('echo "$0" > "$XDG_DATA_HOME/save"; echo "$0" > game/hookshot_options.ini; '
-                  'echo "$0" > "game/only-$0"')
+                  'echo "$0" > "game/only-$0"; cp game/hookshot_options.ini "game/only-$0" "$XDG_DATA_HOME/"')
         for job_id, letter in ((first, "A"), (second, "B")):
             env = jobs.launch_env(jobs.job_dir(self.cfg, job_id), {"HOS_EXAMPLE": "1"})
             jobs.start(self.cfg, job_id, ["sh", "-c", script, letter], env=env, game=game)
@@ -426,14 +494,135 @@ class JobTests(unittest.TestCase):
         self.assertNotEqual(a, b)
         self.assertEqual(Path(a, "data", "save").read_text(encoding="utf-8"), "A\n")
         self.assertEqual(Path(b, "data", "save").read_text(encoding="utf-8"), "B\n")
-        self.assertEqual(Path(a, "game", "hookshot_options.ini").read_text(encoding="utf-8"), "A\n")
-        self.assertEqual(Path(b, "game", "hookshot_options.ini").read_text(encoding="utf-8"), "B\n")
-        self.assertTrue(Path(a, "game", "only-A").is_file())
-        self.assertFalse(Path(a, "game", "only-B").exists())
-        self.assertTrue(Path(b, "game", "only-B").is_file())
-        self.assertFalse(Path(b, "game", "only-A").exists())
+        self.assertEqual(Path(a, "data", "hookshot_options.ini").read_text(encoding="utf-8"), "A\n")
+        self.assertEqual(Path(b, "data", "hookshot_options.ini").read_text(encoding="utf-8"), "B\n")
+        self.assertTrue(Path(a, "data", "only-A").is_file())
+        self.assertFalse(Path(a, "data", "only-B").exists())
+        self.assertTrue(Path(b, "data", "only-B").is_file())
+        self.assertFalse(Path(b, "data", "only-A").exists())
+        self.assertFalse(Path(a, "game").exists())
+        self.assertFalse(Path(b, "game").exists())
         self.assertEqual(sorted(p.name for p in Path(game).iterdir()), ["hookshot", "hookshot_options.ini"])
         self.assertEqual(Path(game, "hookshot_options.ini").read_text(encoding="utf-8"), "build\n")
+
+    # DL60: the job's end removes its game folder, keeps the rest, and records its exclusive size as its kind's last
+    # size; a start under twice that size is refused under the start lock, before its folder is made
+
+    def test_a_finished_job_drops_its_game_folder_keeps_the_rest_and_records_the_exclusive_size(self):
+        game = self.build("abc1234", {"payload": "exe\n"})
+        job_id = jobs.new_id("check")
+        os.environ["FAKE_BTRFS_EXCL"] = "123456"
+        jobs.start(self.cfg, job_id, ["sh", "-c", "echo out; echo save > data/save"], game=game)
+        job = Path(jobs.job_dir(self.cfg, job_id))
+        self.assertFalse(Path(job, "game").exists())
+        for kept in ("output.log", "run", "data", "tools", "exit"):
+            self.assertTrue(Path(job, kept).exists(), kept)
+        self.assertEqual(Path(job, "data", "save").read_text(encoding="utf-8"), "save\n")
+        self.assertEqual(Path(job, "output.log").read_text(encoding="utf-8"), "out\n")
+        self.assertEqual(Path(job, "exit").read_text(encoding="utf-8"), "0\n")
+        self.assertEqual(self.size_file("check").read_text(encoding="utf-8"), "123456\n")
+        self.assertEqual(self.calls("btrfs"), [["filesystem", "du", "-s", "--raw", str(job)]])
+        self.assertTrue(Path(game, "payload").is_file())
+
+    def test_the_job_is_measured_before_its_game_folder_goes_and_its_exit_file_is_written_after(self):
+        game = self.build("abc1234", {"payload": "exe\n"})
+        job_id = jobs.new_id("check")
+        jobs.start(self.cfg, job_id, ["true"], game=game)
+        job = Path(jobs.job_dir(self.cfg, job_id))
+        order = [entry[0] for entry in self.events()]
+        self.assertLess(order.index("btrfs"), order.index("rm"))
+        self.assertEqual(self.calls("rm"), [["-rf", "--", str(Path(job, "game")), "exit-present=False"]])
+        self.assertTrue(Path(job, "exit").is_file())
+
+    def test_every_kind_records_its_size_builds_included_and_a_job_without_a_game_folder_too(self):
+        os.environ["FAKE_BTRFS_EXCL"] = "2048"
+        for kind in jobs.KINDS:
+            with self.subTest(kind=kind):
+                jobs.start(self.cfg, jobs.new_id(kind), ["true"])
+                self.assertEqual(self.size_file(kind).read_text(encoding="utf-8"), "2048\n")
+
+    def test_a_job_whose_game_folder_cannot_be_removed_says_so_and_keeps_its_status(self):
+        game = self.build("abc1234", {"payload": "exe\n"})
+        os.environ["FAKE_RM_FAIL"] = "1"
+        job_id = jobs.new_id("check")
+        jobs.start(self.cfg, job_id, ["sh", "-c", "exit 5"], game=game)
+        job = Path(jobs.job_dir(self.cfg, job_id))
+        self.assertIn("cannot remove", Path(job, "output.log").read_text(encoding="utf-8"))
+        self.assertTrue(Path(job, "game", "payload").is_file())
+        self.assertEqual(Path(job, "exit").read_text(encoding="utf-8"), "5\n")
+
+    def test_a_job_btrfs_cannot_measure_says_so_and_keeps_the_last_size(self):
+        game = self.build("abc1234", {"payload": "exe\n"})
+        self.set_size("check", "777\n")
+        os.environ["FAKE_BTRFS_FAIL"] = "1"
+        job_id = jobs.new_id("check")
+        jobs.start(self.cfg, job_id, ["sh", "-c", "exit 5"], game=game)
+        job = Path(jobs.job_dir(self.cfg, job_id))
+        output = Path(job, "output.log").read_text(encoding="utf-8")
+        self.assertIn("not a btrfs filesystem", output)
+        self.assertIn("cannot measure", output)
+        self.assertEqual(self.size_file("check").read_text(encoding="utf-8"), "777\n")
+        self.assertFalse(Path(job, "game").exists())
+        self.assertEqual(Path(job, "exit").read_text(encoding="utf-8"), "5\n")
+
+    def test_a_start_under_twice_the_kinds_last_size_is_refused_naming_both_numbers_before_its_folder(self):
+        self.set_size("check", "1000\n")
+        os.environ["FAKE_AVAIL"] = "1999"
+        job_id = jobs.new_id("check")
+        with self.assertRaises(jobs.JobError) as caught:
+            jobs.start(self.cfg, job_id, ["true"])
+        self.assertIn("1999", str(caught.exception))
+        self.assertIn("2000", str(caught.exception))
+        self.assertEqual(self.calls("df"), [["--output=avail", "-B1", str(self.root)]])
+        self.assertFalse(Path(jobs.job_dir(self.cfg, job_id)).exists())
+        self.assertEqual(self.calls("systemd-run"), [])
+
+    def test_the_refusal_exits_with_its_own_status(self):
+        self.set_size("check", "1000\n")
+        os.environ["FAKE_AVAIL"] = "1999"
+        refused = self.run_start(jobs.new_id("check"), ["true"])
+        self.assertEqual(refused.returncode, jobs.LOW_SPACE)
+        self.assertIn("1999", refused.stderr)
+        self.assertEqual(self.calls("systemd-run"), [])
+
+    def test_a_start_with_twice_the_kinds_last_size_free_starts(self):
+        self.set_size("check", "1000\n")
+        os.environ["FAKE_AVAIL"] = "2000"
+        job_id = jobs.new_id("check")
+        jobs.start(self.cfg, job_id, ["true"])
+        (run,) = self.calls("systemd-run")
+        self.assertIn("--unit=%s" % jobs.unit(job_id), run)
+
+    def test_a_kind_with_no_size_starts_unchecked_and_another_kinds_size_does_not_hold_it(self):
+        self.set_size("bench", "%d\n" % 10 ** 12)
+        os.environ["FAKE_AVAIL"] = "1"
+        job_id = jobs.new_id("check")
+        jobs.start(self.cfg, job_id, ["true"])
+        self.assertEqual(self.calls("df"), [])
+        (run,) = self.calls("systemd-run")
+        self.assertIn("--unit=%s" % jobs.unit(job_id), run)
+
+    def test_the_space_check_runs_under_the_start_lock_before_the_folder_is_made(self):
+        self.set_size("check", "1000\n")
+        os.environ["FAKE_AVAIL"] = "1"
+        job_id = jobs.new_id("check")
+        script = jobs.start_script(self.cfg, job_id, ["true"])
+        tar = Path(self.tmp.name) / "tools.tar"
+        tar.write_bytes(jobs.tools_tar())
+        out = Path(self.tmp.name) / "out.txt"
+        with open(self.root / "start.lock", "w", encoding="utf-8") as lock, open(tar, "rb") as stdin, \
+                open(out, "w", encoding="utf-8") as stdout:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            proc = subprocess.Popen(remote.command(HOST, script), stdin=stdin, stdout=stdout, stderr=subprocess.STDOUT)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                proc.wait(timeout=1)
+            self.assertEqual(self.calls("df"), [])
+            self.assertFalse(Path(jobs.job_dir(self.cfg, job_id)).exists())
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        self.assertEqual(proc.wait(timeout=30), jobs.LOW_SPACE)
+        self.assertEqual(len(self.calls("df")), 1)
+        self.assertFalse(Path(jobs.job_dir(self.cfg, job_id)).exists())
+        self.assertIn("disk: refused", out.read_text(encoding="utf-8"))
 
     def test_launch_env_sets_the_saves_folder_the_update_check_and_the_device_variables(self):
         self.assertEqual(jobs.launch_env("/x/jobs/j", {"HOS_EXAMPLE": "1"}),
@@ -591,6 +780,9 @@ class SmokeTests(unittest.TestCase):
         scripts = {"ssh": FAKE_SSH,
                    "systemd-run": shim(sys.executable, fakes, "systemd-run"),
                    "systemctl": shim(sys.executable, fakes, "systemctl"),
+                   "btrfs": shim(sys.executable, fakes, "btrfs"),
+                   "df": shim(sys.executable, fakes, "df"),
+                   "rm": shim(sys.executable, fakes, "rm"),
                    "python": "#!/bin/sh\nexec %s \"$@\"\n" % shlex.quote(sys.executable)}
         for name, body in scripts.items():
             fake = bin_dir / name
@@ -617,11 +809,14 @@ class SmokeTests(unittest.TestCase):
             "FAKE_STEPS": str(self.steps),
             "FAKE_GROW": str(self.grow),
             "FAKE_RENDERER": "example GPU (Vulkan, native)",
+            "FAKE_BTRFS_EXCL": "4096",
+            "FAKE_AVAIL": "1000000000000",
             "HX_CONFIG": self.conf,
         })
         env.start()
         self.addCleanup(env.stop)
-        for var in ("FAKE_SSH_REFUSE", "FAKE_FALLBACK", "FAKE_DIE_ON_WAIT", "FAKE_STALL", "FAKE_REPLAYED"):
+        for var in ("FAKE_SSH_REFUSE", "FAKE_FALLBACK", "FAKE_DIE_ON_WAIT", "FAKE_STALL", "FAKE_REPLAYED",
+                    "FAKE_BTRFS_FAIL", "FAKE_RM_FAIL"):
             os.environ.pop(var, None)
         self.cfg = config.load(self.conf)
 
@@ -689,7 +884,9 @@ class SmokeTests(unittest.TestCase):
                 str(Path(job, "tools", "scripts", "harness", "hx.py")), "smoke", "--in-job", job, "--hold", str(self.hold),
                 "--expect", "example GPU", "--frames", "7", "--env", "HOS_EXAMPLE=1"]
         self.assertEqual(run[-len(argv):], argv)
-        self.assertEqual(Path(job, "game", "marker").read_text(encoding="utf-8"), "abc1234\n")
+        self.assertEqual(self.calls("rm"),
+                         [["-rf", "--", str(Path(job, "game")), "exit-present=False", "marker=abc1234"]])
+        self.assertFalse(Path(job, "game").exists())
         self.assertIn("build: abc1234", done.stdout.splitlines())
         self.assertIn("job: " + Path(job).name, done.stdout.splitlines())
 
@@ -702,7 +899,10 @@ class SmokeTests(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("build: " + head, done.stdout.splitlines())
         (run,) = self.calls("systemd-run")
-        self.assertEqual(Path(self.job_of(run), "game", "marker").read_text(encoding="utf-8"), head + "\n")
+        job = self.job_of(run)
+        self.assertEqual(self.calls("rm"),
+                         [["-rf", "--", str(Path(job, "game")), "exit-present=False", "marker=" + head]])
+        self.assertFalse(Path(job, "game").exists())
 
     def test_a_build_rev_that_is_no_commit_here_exits_2(self):
         self.build("abc1234")
