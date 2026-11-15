@@ -2,13 +2,15 @@
 systemctl stand in for the user manager: systemd-run runs the unit's command to its end, in the foreground, with its
 environment and its output in output.log, and systemctl answers from files the test writes. Checks: the unit's arguments
 and that the argv runs with its environment, its output and its status (R2); the hold refused before the folder is made
-and when it appears while the folder is made, and wait_hold (R3); a bench refused beside any other job and a check
-beside a check (R4); separate folders, saves and game copies for two jobs of one build (R5); a start waiting for the
+and when it appears while the folder is made, and wait_hold (R3); a build refused beside a build or a bench, a bench
+refused beside any other job, and a check beside a check or a build (R4); separate folders, saves and game copies for
+two jobs of one build (R5); a start waiting for the
 start lock; follow's output, status and a lost ssh; and the job id, the quoting and an empty command. The job's end
-(DL60): its game folder removed, its exit file written after that, its exclusive size kept as its kind's last size
-(every kind, a size btrfs cannot measure left as it was), a failed removal reported in its output with its status
-kept, and a start under twice that size refused with its own status, under the start lock and before its folder is
-made. hx smoke
+(DL60, DL181): its game and shots folders removed at any depth, its data kept, its exit file written after those, its
+exclusive size kept as its kind's last size (its game size when it copied a game; every kind, a size btrfs cannot
+measure left as it was), a failed removal reported in its output with its status kept, a link out of the job folder
+not followed, and a start under twice that size refused with its own status, under the start lock and before its
+folder is made. A job stopped by SIGTERM removes the same folders, records no size and exits 143. hx smoke
 (SmokeTests): its refusals, the job it starts (argv, game folder, device env) and the verdict of the in-job half against
 a stand-in game (R6), and its hold (R3). Nothing reaches a real host or a systemd user manager.
 
@@ -65,8 +67,9 @@ exec sh -c "$4"
 # "inactive" (exit 3), or "active:TEXT", which appends TEXT and a newline to $FAKE_GROW and answers active (exit 0).
 # btrfs filesystem du -s --raw prints the Exclusive bytes $FAKE_BTRFS_EXCL, with a Total 4096 more (or fails when
 # $FAKE_BTRFS_FAIL is set); df --output=avail -B1 prints $FAKE_AVAIL; rm -rf -- PATH records, with the call, whether the
-# exit file beside PATH exists yet and the text of PATH's marker file (when it has one), then removes PATH (or fails
-# when $FAKE_RM_FAIL is set, removing nothing).
+# job's exit file exists yet (the one beside PATH, or the one in $FAKE_JOB when that is set: a folder nested in the job
+# has none beside it) and the text of PATH's marker file (when it has one), then removes PATH (or fails when
+# $FAKE_RM_FAIL is set, removing nothing).
 FAKE_TOOLS = r'''
 import json
 import os
@@ -187,7 +190,7 @@ def rm(args):
     if len(args) != 3 or args[:2] != ["-rf", "--"]:
         fail("want rm -rf -- <path>, got: %s" % " ".join(args))
     path = args[2]
-    exit_file = os.path.join(os.path.dirname(path), "exit")
+    exit_file = os.path.join(os.environ.get("FAKE_JOB", os.path.dirname(path)), "exit")
     marker = os.path.join(path, "marker")
     extra = []
     if os.path.isfile(marker):
@@ -283,12 +286,12 @@ class JobTests(unittest.TestCase):
             return []
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
 
-    def size_file(self, kind):
-        return Path(self.root, "jobs", kind + ".size")
+    def size_file(self, kind, game=False):
+        return Path(self.root, "jobs", kind + (".game.size" if game else ".size"))
 
-    def set_size(self, kind, text):
-        self.size_file(kind).parent.mkdir(parents=True, exist_ok=True)
-        self.size_file(kind).write_text(text, encoding="utf-8")
+    def set_size(self, kind, text, game=False):
+        self.size_file(kind, game).parent.mkdir(parents=True, exist_ok=True)
+        self.size_file(kind, game).write_text(text, encoding="utf-8")
 
     def run_start(self, job_id, argv, env=None, game=None):
         script = jobs.start_script(self.cfg, job_id, argv, env, game)
@@ -440,7 +443,7 @@ class JobTests(unittest.TestCase):
             waited = jobs.wait_hold(str(self.hold), out=out, sleep=sleeps.append)
         self.assertEqual((waited, sleeps, out.getvalue()), (0.0, [], ""))
 
-    # R4: the benchmark excludes the others; correctness jobs may overlap
+    # R4: a bench runs alone; a build excludes builds and benches; a check runs beside checks and builds
 
     def test_r4_a_bench_is_refused_while_a_check_runs(self):
         check = jobs.new_id("check")
@@ -456,6 +459,32 @@ class JobTests(unittest.TestCase):
         refused = self.run_start(jobs.new_id("bench"), ["true"])
         self.assertEqual(refused.returncode, jobs.BUSY)
         self.assertEqual(self.calls("systemd-run"), [])
+
+    def test_r4_a_build_is_refused_while_a_build_runs_and_makes_no_folder(self):
+        running = jobs.new_id("build")
+        self.set_units(jobs.unit(running))
+        second = jobs.new_id("build")
+        refused = self.run_start(second, ["true"])
+        self.assertEqual(refused.returncode, jobs.BUSY)
+        self.assertIn(jobs.unit(running), refused.stderr)
+        self.assertEqual(self.calls("systemd-run"), [])
+        self.assertFalse(Path(jobs.job_dir(self.cfg, second)).exists())
+
+    def test_r4_a_build_is_refused_while_a_bench_runs(self):
+        bench = jobs.new_id("bench")
+        self.set_units(jobs.unit(bench))
+        refused = self.run_start(jobs.new_id("build"), ["true"])
+        self.assertEqual(refused.returncode, jobs.BUSY)
+        self.assertIn(jobs.unit(bench), refused.stderr)
+        self.assertEqual(self.calls("systemd-run"), [])
+
+    def test_r4_a_check_starts_beside_a_running_build(self):
+        build = jobs.new_id("build")
+        self.set_units(jobs.unit(build))
+        check = jobs.new_id("check")
+        jobs.start(self.cfg, check, ["true"])
+        (run,) = self.calls("systemd-run")
+        self.assertIn("--unit=%s" % jobs.unit(check), run)
 
     def test_r4_a_check_is_refused_while_a_bench_runs(self):
         bench = jobs.new_id("bench")
@@ -505,8 +534,9 @@ class JobTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in Path(game).iterdir()), ["hookshot", "hookshot_options.ini"])
         self.assertEqual(Path(game, "hookshot_options.ini").read_text(encoding="utf-8"), "build\n")
 
-    # DL60: the job's end removes its game folder, keeps the rest, and records its exclusive size as its kind's last
-    # size; a start under twice that size is refused under the start lock, before its folder is made
+    # DL60, DL181: the job's end removes its game and shots folders, keeps the rest, and records its exclusive size as
+    # its kind's last size, the game size when it copied a game; a start under twice that size is refused under the
+    # start lock, before its folder is made
 
     def test_a_finished_job_drops_its_game_folder_keeps_the_rest_and_records_the_exclusive_size(self):
         game = self.build("abc1234", {"payload": "exe\n"})
@@ -520,7 +550,7 @@ class JobTests(unittest.TestCase):
         self.assertEqual(Path(job, "data", "save").read_text(encoding="utf-8"), "save\n")
         self.assertEqual(Path(job, "output.log").read_text(encoding="utf-8"), "out\n")
         self.assertEqual(Path(job, "exit").read_text(encoding="utf-8"), "0\n")
-        self.assertEqual(self.size_file("check").read_text(encoding="utf-8"), "123456\n")
+        self.assertEqual(self.size_file("check", game=True).read_text(encoding="utf-8"), "123456\n")
         self.assertEqual(self.calls("btrfs"), [["filesystem", "du", "-s", "--raw", str(job)]])
         self.assertTrue(Path(game, "payload").is_file())
 
@@ -553,7 +583,7 @@ class JobTests(unittest.TestCase):
 
     def test_a_job_btrfs_cannot_measure_says_so_and_keeps_the_last_size(self):
         game = self.build("abc1234", {"payload": "exe\n"})
-        self.set_size("check", "777\n")
+        self.set_size("check", "777\n", game=True)
         os.environ["FAKE_BTRFS_FAIL"] = "1"
         job_id = jobs.new_id("check")
         jobs.start(self.cfg, job_id, ["sh", "-c", "exit 5"], game=game)
@@ -561,9 +591,71 @@ class JobTests(unittest.TestCase):
         output = Path(job, "output.log").read_text(encoding="utf-8")
         self.assertIn("not a btrfs filesystem", output)
         self.assertIn("cannot measure", output)
-        self.assertEqual(self.size_file("check").read_text(encoding="utf-8"), "777\n")
+        self.assertEqual(self.size_file("check", game=True).read_text(encoding="utf-8"), "777\n")
         self.assertFalse(Path(job, "game").exists())
         self.assertEqual(Path(job, "exit").read_text(encoding="utf-8"), "5\n")
+
+    def test_a_finished_job_removes_every_game_and_shots_folder_at_any_depth_and_keeps_its_data(self):
+        game = self.build("abc1234", {"payload": "exe\n"})
+        job_id = jobs.new_id("check")
+        script = ("mkdir -p shots runs/01/game runs/01/shots runs/01/data; echo save > data/save; "
+                  "echo save > runs/01/data/save; echo shot > runs/01/shots/shot.png")
+        jobs.start(self.cfg, job_id, ["sh", "-c", script], game=game)
+        job = Path(jobs.job_dir(self.cfg, job_id))
+        for gone in ("game", "shots", "runs/01/game", "runs/01/shots"):
+            self.assertFalse(Path(job, gone).exists(), gone)
+        for kept in ("data/save", "runs/01/data/save", "output.log", "exit"):
+            self.assertTrue(Path(job, kept).is_file(), kept)
+        self.assertEqual(sorted(call[2] for call in self.calls("rm")),
+                         sorted(str(Path(job, p)) for p in ("game", "shots", "runs/01/game", "runs/01/shots")))
+        self.assertTrue(Path(game, "payload").is_file())
+
+    def test_the_nested_folders_are_removed_before_the_exit_file_is_written(self):
+        game = self.build("abc1234", {"payload": "exe\n"})
+        job_id = jobs.new_id("check")
+        job = Path(jobs.job_dir(self.cfg, job_id))
+        os.environ["FAKE_JOB"] = str(job)
+        jobs.start(self.cfg, job_id, ["sh", "-c", "mkdir -p shots runs/01/game runs/01/shots"], game=game)
+        expected = sorted(str(Path(job, p)) for p in ("game", "shots", "runs/01/game", "runs/01/shots"))
+        removed = self.calls("rm")
+        self.assertEqual(sorted(call[2] for call in removed), expected)
+        self.assertEqual([call[3] for call in removed], ["exit-present=False"] * len(expected))
+        self.assertTrue(Path(job, "exit").is_file())
+
+    def test_a_job_stopped_by_sigterm_removes_its_game_and_shots_folders_keeps_its_data_and_exits_143(self):
+        game = self.build("abc1234", {"payload": "exe\n"})
+        self.set_size("check", "777\n", game=True)
+        job_id = jobs.new_id("check")
+        job = Path(jobs.job_dir(self.cfg, job_id))
+        os.environ["FAKE_JOB"] = str(job)
+        # A stop: systemd signals the whole control group, so the wrapper ($PPID) and the command ($$) get SIGTERM.
+        script = ("mkdir -p shots runs/01/game runs/01/shots runs/01/data; echo save > data/save; "
+                  "echo save > runs/01/data/save; kill -TERM $PPID $$")
+        jobs.start(self.cfg, job_id, ["sh", "-c", script], game=game)
+        for gone in ("game", "shots", "runs/01/game", "runs/01/shots"):
+            self.assertFalse(Path(job, gone).exists(), gone)
+        for kept in ("data/save", "runs/01/data/save"):
+            self.assertTrue(Path(job, kept).is_file(), kept)
+        expected = sorted(str(Path(job, p)) for p in ("game", "shots", "runs/01/game", "runs/01/shots"))
+        removed = self.calls("rm")
+        self.assertEqual(sorted(call[2] for call in removed), expected)
+        self.assertEqual([call[3] for call in removed], ["exit-present=False"] * len(expected))
+        self.assertEqual(Path(job, "exit").read_text(encoding="utf-8"), "143\n")
+        self.assertEqual(self.size_file("check", game=True).read_text(encoding="utf-8"), "777\n")
+        self.assertEqual(self.calls("btrfs"), [])
+        done = self.follow(job_id)
+        self.assertEqual(done.returncode, 143, done.stderr)
+
+    def test_removal_never_follows_a_link_out_of_the_job_folder(self):
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("kept\n", encoding="utf-8")
+        job_id = jobs.new_id("check")
+        script = 'mkdir -p runs/01/shots && ln -s "$HX_OUTSIDE" runs/shots'
+        jobs.start(self.cfg, job_id, ["sh", "-c", script], env={"HX_OUTSIDE": str(outside)})
+        job = Path(jobs.job_dir(self.cfg, job_id))
+        self.assertFalse(Path(job, "runs", "01", "shots").exists())
+        self.assertEqual((outside / "keep.txt").read_text(encoding="utf-8"), "kept\n")
 
     def test_a_start_under_twice_the_kinds_last_size_is_refused_naming_both_numbers_before_its_folder(self):
         self.set_size("check", "1000\n")
@@ -623,6 +715,35 @@ class JobTests(unittest.TestCase):
         self.assertEqual(len(self.calls("df")), 1)
         self.assertFalse(Path(jobs.job_dir(self.cfg, job_id)).exists())
         self.assertIn("disk: refused", out.read_text(encoding="utf-8"))
+
+    # A job's last size is kept per kind and per whether it copies a game: a job that copies no game never changes the
+    # guard of a job that does, and a job that copies one never changes the guard of a job that does not
+
+    def test_a_job_without_a_game_leaves_the_game_size_and_a_start_with_a_game_is_refused_under_twice_that(self):
+        game = self.build("abc1234", {"payload": "exe\n"})
+        self.set_size("check", "1000\n", game=True)
+        os.environ["FAKE_BTRFS_EXCL"] = "700"
+        jobs.start(self.cfg, jobs.new_id("check"), ["true"])
+        self.assertEqual(self.size_file("check").read_text(encoding="utf-8"), "700\n")
+        self.assertEqual(self.size_file("check", game=True).read_text(encoding="utf-8"), "1000\n")
+        os.environ["FAKE_AVAIL"] = "1999"
+        refused_id = jobs.new_id("check")
+        with self.assertRaises(jobs.JobError) as caught:
+            jobs.start(self.cfg, refused_id, ["true"], game=game)
+        self.assertIn("1999", str(caught.exception))
+        self.assertIn("2000", str(caught.exception))
+        self.assertFalse(Path(jobs.job_dir(self.cfg, refused_id)).exists())
+
+    def test_a_start_without_a_game_is_guarded_by_the_gameless_size_and_not_by_the_game_size(self):
+        game = self.build("abc1234", {"payload": "exe\n"})
+        self.set_size("check", "1000\n")
+        os.environ["FAKE_BTRFS_EXCL"] = str(10 ** 12)
+        jobs.start(self.cfg, jobs.new_id("check"), ["true"], game=game)
+        self.assertEqual(self.size_file("check").read_text(encoding="utf-8"), "1000\n")
+        os.environ["FAKE_AVAIL"] = "2000"
+        started = self.run_start(jobs.new_id("check"), ["true"])
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertEqual(self.calls("df"), [["--output=avail", "-B1", str(self.root)]])
 
     def test_launch_env_sets_the_saves_folder_the_update_check_and_the_device_variables(self):
         self.assertEqual(jobs.launch_env("/x/jobs/j", {"HOS_EXAMPLE": "1"}),

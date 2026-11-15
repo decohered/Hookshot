@@ -1,10 +1,14 @@
 """The harness's jobs on the build host. Each job is a transient systemd user unit, hx-<job id>.service, that outlives the
 ssh session that started it, in a folder of its own under the harness root. start() runs one guarded script over ssh:
 under the start lock it refuses while the hold file exists, while a job the kind forbids is running (a bench runs
-alone), and while the harness root has under twice the kind's last size free; then it makes the job folder, unpacks the
-tools, copies the build's game folder in and starts the unit. When a job's command ends, its wrapper records the job
-folder's exclusive size as its kind's last size, removes the job's game folder, and writes the exit file. follow()
-prints a job's output to its end and returns its status. wait_hold() is what a job runs before each launch.
+alone, and a build is refused beside a build or a bench, because builds share the harness root's builder cache and the
+dev_packs bases), and while the harness root has under twice the last size free. The last size is kept per kind and per
+whether the job copies a game: a job given a game folder reads and records <kind>.game.size, and a job without one reads
+and records <kind>.size, so neither changes the other's guard. Then the script makes the job folder, unpacks the tools,
+copies the build's game folder in and starts the unit. When a job's command ends, its wrapper records the job folder's
+exclusive size as that same last size, removes every game and shots folder under the job folder, and writes the exit
+file. A stopped job (SIGTERM to its wrapper) has the same folders removed, records no size, and ends with status 143.
+follow() prints a job's output to its end and returns its status. wait_hold() is what a job runs before each launch.
 
 Every path and value that reaches the host is shell-quoted, and a job id is checked against the new_id shape before it
 makes a path or a unit name. Paths on the host are POSIX whatever the PC is.
@@ -31,19 +35,25 @@ CHECKOUT = Path(__file__).resolve().parents[2]
 JOB_ID = re.compile(r"(build|check|bench)-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 BUILD_SHA = re.compile(r"[0-9a-f]{7,64}")
 # The job's wrapper, run as bash -c WRAPPER hx <exit file> <job folder> <kind's size file> <argv...>. It runs the argv,
-# records the job folder's exclusive size as the kind's last size (when btrfs cannot measure it, the job's output says
-# so and the size is left as it was), removes the job's game folder, and only then writes the exit file.
+# records the job folder's exclusive size in its size file (when btrfs cannot measure it, the job's output says so and
+# the size is left as it was), removes every game and shots folder under the job folder, and only then writes the exit
+# file. A SIGTERM (a stop, sent to the whole control group) removes those folders the same way, records no size,
+# writes 143 and exits 143. Bash runs that trap once the argv has ended, as it waits for a foreground command first.
 WRAPPER = r"""f=$1; job=$2; size_file=$3; shift 3
+clear_nested() {
+  find "$job" -type d \( -name game -o -name shots \) -prune -exec rm -rf -- {} \;
+}
+trap 'clear_nested; echo 143 > "$f"; exit 143' TERM
 "$@"; s=$?
 excl=
 if du=$(btrfs filesystem du -s --raw "$job"); then
   read -r _ excl _ <<< "$(printf '%s\n' "$du" | tail -n 1)"
 fi
 case $excl in
-  ''|*[!0-9]*) echo "job size: btrfs cannot measure $job; the last size of its kind is unchanged" ;;
+  ''|*[!0-9]*) echo "job size: btrfs cannot measure $job; the last size is unchanged" ;;
   *) printf '%s\n' "$excl" > "$size_file.tmp" && mv -f "$size_file.tmp" "$size_file" ;;
 esac
-rm -rf -- "$job/game"
+clear_nested
 echo "$s" > "$f"
 exit "$s"
 """
@@ -94,12 +104,17 @@ def tools_tar(checkout=CHECKOUT):
 def start_script(cfg, job_id, argv, env=None, game=None):
     """The bash script that starts job_id. It runs under the start lock and checks the hold before the folder is made
     and again just before the unit starts, so a hold that appears while the folder is copied still stops the unit.
-    A kind with a last size is refused while the harness root's filesystem has under twice that free."""
+    A kind with a last size is refused while the harness root's filesystem has under twice that free. The last size is
+    kept per kind and per whether the start is given a game: with one it reads and records <kind>.game.size, without one
+    <kind>.size, so neither kind of start changes the other's guard.
+    The running jobs are read under that lock, and the unit starts before it is released, so the refusal and the start
+    are one step: a bench is refused beside any other job, and a build beside a build or a bench, because builds share
+    the harness root's builder cache and the dev_packs bases. A check is refused only beside a bench."""
     if not argv:
         raise JobError("a job needs a command to run")
     job = job_dir(cfg, job_id)
     kind = job_id.split("-")[0]
-    size_file = posixpath.join(cfg.root, "jobs", kind + ".size")
+    size_file = posixpath.join(cfg.root, "jobs", kind + (".game.size" if game is not None else ".size"))
     log = posixpath.join(job, "output.log")
     q = shlex.quote
     head = ["systemd-run", "--user", "--unit=" + unit(job_id), "--collect", "--working-directory=" + job]
@@ -126,7 +141,7 @@ def start_script(cfg, job_id, argv, env=None, game=None):
         "busy=",
         "while read -r u _; do",
         '  case "$kind:$u" in',
-        '    bench:hx-*|*:hx-bench-*) busy="$busy $u" ;;',
+        '    bench:hx-*|*:hx-bench-*|build:hx-build-*) busy="$busy $u" ;;',
         "  esac",
         'done <<< "$running"',
         'if [ -n "$busy" ]; then',

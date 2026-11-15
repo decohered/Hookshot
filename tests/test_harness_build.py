@@ -11,7 +11,15 @@ output in console.log on the host and devenv's output shown only when devenv she
 the console.log path and its last 20 lines, and returns the status; an unknown rev returns 2 before
 anything reaches the host; a refused start returns 1; a lost ssh returns 255; a failed copy returns 1; the dirty diff is the
 one from before the build, even when the checkout changes during it; a build folder keeps the record of the build that last
-succeeded there, or none. Nothing reaches a real host.
+succeeded there, or none. hx build --base <rev> runs the real scripts/dev_packs.py base in one job, from the revision's
+history sent as a bundle: the job runs the in-job half through the closure entry; the source is a git repository at the
+revision holding its tree; base.json names the commit; the record hashes the files in the base's game folder; a dirty
+checkout's diff is kept; a failing step stops the job and prints its status and console tail; this checkout gains no ref;
+an unknown rev returns 2 before anything reaches the host.
+hx build --pack <rev> --on <base rev> builds the change over the kept base in one job, with the real dev_packs.py pack and a
+stand-in nx2/build.py: the record holds the renderer's hash and build_s. A change that is not renderer-only, a base that is no
+ancestor, or an unknown rev returns 2 before anything reaches the host; a base that was never built exits 1 before the job;
+a pack.json naming another base, head or route is not recorded. Nothing reaches a real host.
 
 python -I -B tests/test_harness_build.py
 """
@@ -39,6 +47,9 @@ CLOSURE = "/nix/store/7mkzq3d0ghs1c5lgh1f9m0nvq8bx0c6a-devenv-shell"
 JOB = re.compile(r"build-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 STAND_IN_HOOKSHOT = b"stand-in executable\n"
 STAND_IN_RENDERER = b"stand-in renderer\n"
+STAND_IN_PACK_RENDERER = b"stand-in pack renderer\n"
+STAND_IN_OBJECT = b"stand-in object\n"
+BUNDLE_NAME = "src.bundle"
 FAKE_NAMES = ("ssh", "nix", "nix-store", "devenv", "systemd-run", "systemctl")
 
 # The fakes, in one Python file that the shims run as: python -I fakes.py <tool> <arguments>. Every call is recorded as a
@@ -161,32 +172,94 @@ tools = {"ssh": ssh, "nix": nix, "nix-store": nix_store, "devenv": devenv, "syst
 sys.exit(tools[sys.argv[1]](sys.argv[2:]))
 '''
 
-# The stand-in for nx2/make_game.py: it writes the two binaries and the log, and exits with $HX_STANDIN_STATUS. With
+# The stand-in for nx2/make_game.py: it writes the two binaries and, when given --log (hx build's call), the log, and exits with
+# $HX_STANDIN_STATUS. It takes dev_packs.py base's arguments too (--romfs, --exefs, --work, --language, with no --log). With
 # $HX_STANDIN_EDIT set, it also rewrites that file, as an edit to the checkout while the build runs. As make_game's console
-# output it prints a marker on each stream, then 25 numbered lines on stdout.
+# output it prints a marker on each stream, then 25 numbered lines on stdout. dev_packs.py imports it for lift_sources(), which
+# finds no lift here, so its arguments are read only when it runs.
 MAKE_GAME = r'''"""A stand-in for nx2/make_game.py: it writes the two binaries and the log, and exits with HX_STANDIN_STATUS."""
 import argparse
 import os
 import pathlib
 import sys
 
+
+def lift_sources():
+    return []
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--nup")
+    parser.add_argument("--romfs")
+    parser.add_argument("--exefs")
+    parser.add_argument("--work")
+    parser.add_argument("--language")
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--log")
+    args = parser.parse_args()
+    print("stand-in stdout marker", flush=True)
+    print("stand-in stderr marker", file=sys.stderr, flush=True)
+    for n in range(1, 26):
+        print("stand-in line %02d" % n, flush=True)
+    out = pathlib.Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "hookshot").write_bytes(b"stand-in executable\n")
+    (out / "hookshot_vk.so").write_bytes(b"stand-in renderer\n")
+    if args.log:
+        pathlib.Path(args.log).write_text("stand-in build\n", encoding="utf-8")
+    if os.environ.get("HX_STANDIN_EDIT"):
+        pathlib.Path(os.environ["HX_STANDIN_EDIT"]).write_text("edited during the build\n", encoding="utf-8")
+    sys.exit(int(os.environ.get("HX_STANDIN_STATUS", "0")))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+# The stand-in for nx2/nup.py: it makes the exefs and romfs folders of a dump under --extract, and exits with $HX_NUP_STATUS
+# (before it makes anything) when that is set.
+NUP = r'''"""A stand-in for nx2/nup.py: it extracts exefs and romfs folders into --extract, and exits with HX_NUP_STATUS
+when that is set."""
+import argparse
+import os
+import pathlib
+import sys
+
 parser = argparse.ArgumentParser()
-parser.add_argument("--nup")
-parser.add_argument("--out", required=True)
-parser.add_argument("--log", required=True)
+parser.add_argument("nup")
+parser.add_argument("--extract", required=True)
 args = parser.parse_args()
-print("stand-in stdout marker", flush=True)
-print("stand-in stderr marker", file=sys.stderr, flush=True)
-for n in range(1, 26):
-    print("stand-in line %02d" % n, flush=True)
-out = pathlib.Path(args.out)
-out.mkdir(parents=True, exist_ok=True)
-(out / "hookshot").write_bytes(b"stand-in executable\n")
-(out / "hookshot_vk.so").write_bytes(b"stand-in renderer\n")
-pathlib.Path(args.log).write_text("stand-in build\n", encoding="utf-8")
-if os.environ.get("HX_STANDIN_EDIT"):
-    pathlib.Path(os.environ["HX_STANDIN_EDIT"]).write_text("edited during the build\n", encoding="utf-8")
-sys.exit(int(os.environ.get("HX_STANDIN_STATUS", "0")))
+print("stand-in nup marker", flush=True)
+if os.environ.get("HX_NUP_STATUS"):
+    sys.exit(int(os.environ["HX_NUP_STATUS"]))
+out = pathlib.Path(args.extract)
+(out / "exefs").mkdir(parents=True, exist_ok=True)
+(out / "romfs").mkdir(parents=True, exist_ok=True)
+(out / "exefs" / "main").write_bytes(b"stand-in exefs\n")
+(out / "romfs" / "readme.txt").write_bytes(b"stand-in romfs\n")
+'''
+
+# The stand-in for nx2/build.py, which dev_packs.py pack runs as nx2/build.py --standalone with OOT_WORK: it writes the renderer
+# module and its link list (one object) into OOT_WORK's sa/build, and exits with $HX_BUILD_STATUS, before it writes anything,
+# when that is set.
+BUILD = r'''"""A stand-in for nx2/build.py: with --standalone it writes the renderer module and its link list into OOT_WORK."""
+import argparse
+import os
+import pathlib
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--standalone", action="store_true", required=True)
+parser.parse_args()
+if os.environ.get("HX_BUILD_STATUS"):
+    sys.exit(int(os.environ["HX_BUILD_STATUS"]))
+build = pathlib.Path(os.environ["OOT_WORK"]) / "sa" / "build"
+build.mkdir(parents=True, exist_ok=True)
+obj = build / "vk_obj.o"
+obj.write_bytes(b"stand-in object\n")
+(build / "hookshot_vk.so").write_bytes(b"stand-in pack renderer\n")
+(build / "vk_objs.rsp").write_text('"%s"\n' % obj, encoding="utf-8")
 '''
 
 TOML = '''host = "%s"
@@ -234,7 +307,7 @@ class BuildTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         for var in ("FAKE_NIX_FAIL", "FAKE_SSH_LOSE", "FAKE_DEVENV_FAIL", "FAKE_DEVENV_EDIT", "HX_STANDIN_STATUS",
-                    "HX_STANDIN_EDIT"):
+                    "HX_STANDIN_EDIT", "HX_NUP_STATUS", "HX_BUILD_STATUS"):
             os.environ.pop(var, None)
         self.make_checkout()
 
@@ -244,25 +317,44 @@ class BuildTests(unittest.TestCase):
 
     def make_checkout(self):
         self.checkout.mkdir()
-        for path in sorted(HARNESS.glob("*.py")) + [ROOT / "scripts" / "hookshot_ctl.py"]:
+        for path in sorted(HARNESS.glob("*.py")) + [ROOT / "scripts" / "hookshot_ctl.py", ROOT / "scripts" / "dev_packs.py"]:
             dest = self.checkout / path.relative_to(ROOT)
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, dest)
         make_game = self.checkout / "nx2" / "make_game.py"
         make_game.parent.mkdir()
         make_game.write_text(MAKE_GAME, encoding="utf-8")
+        (make_game.parent / "nup.py").write_text(NUP, encoding="utf-8")
+        (make_game.parent / "build.py").write_text(BUILD, encoding="utf-8")
+        self.write_file(".gitignore", ".devenv*\n")   # (as the repository's: the fake devenv's .devenv/gc/shell is no source)
         self.write_notes("first\n")
+        self.write_file("gpu/vk/vk_draw.cpp", "draw first\n")
+        self.write_file("gpu/vk/vk_shared.h", "shared first\n")
+        self.write_file("host/host_view.c", '#include "../gpu/vk/vk_shared.h"\n')
         self.git("init", "-q")
         self.git("add", "-A")
         self.git("commit", "-q", "-m", "first")
 
+    def write_file(self, rel, text):
+        path = self.checkout / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
     def write_notes(self, text):
         (self.checkout / "notes.txt").write_text(text, encoding="utf-8")
 
-    def git(self, *args):
+    def commit(self, message, files):
+        """Writes each file (path -> text), commits all of the checkout's changes, and returns the commit's id"""
+        for rel, text in files.items():
+            self.write_file(rel, text)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+        return self.head()
+
+    def git(self, *args, cwd=None):
         return subprocess.run(["git", "-c", "user.name=harness test", "-c", "user.email=test@example.invalid",
                                "-c", "commit.gpgsign=false", *args],
-                              cwd=str(self.checkout), check=True, capture_output=True, encoding="utf-8").stdout
+                              cwd=str(cwd or self.checkout), check=True, capture_output=True, encoding="utf-8").stdout
 
     def run_build(self, *args):
         hx = self.checkout / "scripts" / "harness" / "hx.py"
@@ -519,6 +611,339 @@ class BuildTests(unittest.TestCase):
         self.assertIn(b"copy refused", proc.stderr)
         self.assertEqual(self.calls("nix-store"), [])
         self.assertEqual(self.calls("systemd-run"), [])
+
+    # R1 (base): hx build --base <rev> keeps a development base at <root>/bases/<sha>, built by dev_packs.py base in one job
+
+    def base_dir(self, sha):
+        return self.root / "bases" / sha
+
+    def run_base(self, *args):
+        return self.run_build("--base", *args)
+
+    def base_record_text(self, sha, job, dirty):
+        base = self.base_dir(sha)
+        game = base / "game"
+        build_s = json.loads((base / "base.json").read_text(encoding="utf-8"))["build_s"]
+        fields = [("closure", CLOSURE), ("sha", sha), ("dirty", dirty),
+                  ("hookshot", sha256((game / "hookshot").read_bytes())),
+                  ("hookshot_vk.so", sha256((game / "hookshot_vk.so").read_bytes())),
+                  ("build_s", str(build_s)), ("base", str(base)), ("job", job)]
+        return "".join("%s: %s\n" % field for field in fields)
+
+    def assert_base_record(self, proc, sha, diff=b""):
+        job = self.only_job()
+        dirty = sha256(diff) if diff else "none"
+        head = self.base_record_text(sha, job, dirty).encode("utf-8")
+        self.assertEqual(proc.stdout, head + diff)
+        self.assertEqual(proc.stderr, b"")
+        self.assertEqual((self.base_dir(sha) / "build.txt").read_bytes(), head)
+        self.assertEqual((self.base_dir(sha) / "dirty.diff").exists(), bool(diff))
+        if diff:
+            self.assertEqual((self.base_dir(sha) / "dirty.diff").read_bytes(), diff)
+
+    def test_r1_base_the_closure_is_copied_to_the_host_and_pinned_there(self):
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 0)
+        self.assertEqual(self.calls("nix"), [["copy", "--to", "ssh://" + HOST, CLOSURE]])
+        gc_root = str(self.root / "gc" / os.path.basename(CLOSURE))
+        self.assertEqual(self.calls("nix-store"), [["--add-root", gc_root, "--realise", CLOSURE]])
+
+    def test_r1_base_the_job_runs_the_in_job_half_through_the_closure_entry(self):
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 0)
+        sha = self.head()
+        job = self.only_job()
+        (run,) = self.calls("systemd-run")
+        hx = self.root / "jobs" / job / "tools" / "scripts" / "harness" / "hx.py"
+        argv = [str(self.enter), CLOSURE, "python", "-I", str(hx), "build", "--in-job", str(self.base_dir(sha)), sha,
+                str(self.dump)]
+        self.assertEqual(run[-len(argv):], argv)
+        self.assertIn("--working-directory=%s" % (self.root / "jobs" / job), run)
+        self.assertIn("--setenv=XDG_CACHE_HOME=%s" % (self.root / "cache"), run)
+        self.assertIn("--setenv=HOOKSHOT_NO_UPDATE_CHECK=1", run)
+
+    def test_r1_base_the_history_is_kept_beside_the_base_as_a_bundle_of_the_revision(self):
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 0)
+        bundle = self.base_dir(self.head()) / "src.bundle"
+        self.assertIn(self.head(), self.git("bundle", "list-heads", str(bundle)))
+
+    def test_r1_base_the_source_is_a_git_repository_at_the_revisions_sha_holding_its_tree(self):
+        self.write_notes("second\n")
+        self.git("commit", "-q", "-am", "second")
+        first = self.git("rev-parse", "HEAD~1").strip()
+        proc = self.run_base("HEAD~1")
+        self.assertExit(proc, 0)
+        src = self.base_dir(first) / "src"
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=src).strip(), first)
+        self.assertEqual((src / "notes.txt").read_text(encoding="utf-8"), "first\n")
+        self.assertEqual(self.git("status", "--porcelain", cwd=src), "")
+
+    def test_r1_base_dev_packs_base_writes_base_json_naming_the_commit_and_its_module_hashes(self):
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 0)
+        sha = self.head()
+        base_json = json.loads((self.base_dir(sha) / "base.json").read_text(encoding="utf-8"))
+        self.assertEqual(base_json["commit"], sha)
+        self.assertEqual(base_json["modules"], {"hookshot": sha256(STAND_IN_HOOKSHOT),
+                                                "hookshot_vk.so": sha256(STAND_IN_RENDERER)})
+        self.assertIsInstance(base_json["build_s"], int)
+
+    def test_r1_base_the_record_is_exact_and_its_hashes_are_the_files_in_game(self):
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 0)
+        self.assert_base_record(proc, self.head())
+
+    def test_r1_base_a_dirty_checkout_prints_the_diffs_sha256_and_the_diff_and_keeps_the_diff(self):
+        self.write_notes("changed\n")
+        diff = self.working_diff()
+        self.assertIn(b"+changed", diff)
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 0)
+        self.assert_base_record(proc, self.head(), diff=diff)
+
+    def test_r1_base_a_failing_step_stops_the_build_and_prints_its_status_and_console_log(self):
+        os.environ["HX_NUP_STATUS"] = "3"
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 3)
+        base = self.base_dir(self.head())
+        console = base / "console.log"
+        self.assertIn(("build failed: exit status 3; log: %s" % console).encode("utf-8"), proc.stdout)
+        self.assertIn("hx build --base: nx2/nup.py failed: exit status 3", console.read_text(encoding="utf-8"))
+        self.assertFalse((base / "game").exists())
+        self.assertFalse((base / "build.txt").exists())
+
+    def test_r1_base_a_failing_dev_packs_step_prints_the_console_log_path_and_its_last_20_lines(self):
+        os.environ["HX_STANDIN_STATUS"] = "3"
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 1)
+        base = self.base_dir(self.head())
+        console = base / "console.log"
+        lines = console.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[-1], "hx build --base: scripts/dev_packs.py base failed: exit status 1")
+        self.assertEqual(proc.stdout.decode("utf-8").splitlines(),
+                         ["build failed: exit status 1; log: %s" % console] + lines[-20:])
+        self.assertFalse((base / "build.txt").exists())
+
+    def test_r1_base_this_checkout_gains_no_ref(self):
+        refs = self.git("for-each-ref", "--format=%(refname) %(objectname)")
+        head = self.head()
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 0)
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname) %(objectname)"), refs)
+        self.assertEqual(self.head(), head)
+
+    def test_r1_base_an_unknown_rev_returns_2_before_anything_reaches_the_host(self):
+        proc = self.run_base("no-such-revision")
+        self.assertExit(proc, 2)
+        self.assertIn(b"no-such-revision", proc.stderr)
+        for tool in ("devenv", "ssh", "nix", "nix-store", "systemd-run"):
+            self.assertEqual(self.calls(tool), [], tool)
+        self.assertFalse((self.root / "bases").exists())
+
+    def test_r1_base_no_rev_is_a_usage_error_returning_2(self):
+        proc = self.run_base()
+        self.assertExit(proc, 2)
+        self.assertIn(b"usage", proc.stderr)
+
+    def test_r1_base_a_lost_ssh_returns_255_and_says_the_build_goes_on(self):
+        os.environ["FAKE_SSH_LOSE"] = "1"
+        proc = self.run_base("HEAD")
+        self.assertExit(proc, 255)
+        job = self.only_job()
+        self.assertIn(("ssh lost: the build goes on as hx-%s.service" % job).encode("utf-8"), proc.stdout)
+        self.assertFalse((self.base_dir(self.head()) / "build.txt").exists())
+
+    # R1 (pack): hx build --pack <rev> --on <base rev> builds a renderer-only change over a kept base, in one job
+
+    def build_base(self, rev="HEAD"):
+        """Builds rev as a base (hx build --base); returns its full id. The calls that build made are forgotten."""
+        proc = self.run_base(rev)
+        self.assertExit(proc, 0)
+        self.log.unlink(missing_ok=True)
+        return self.git("rev-parse", rev).strip()
+
+    def run_pack(self, rev, on):
+        return self.run_build("--pack", rev, "--on", on)
+
+    def pack_folder(self, base, sha):
+        return self.base_dir(base) / "packs" / sha
+
+    def pack_dir(self, base, sha):
+        return self.base_dir(base) / "hx-packs" / sha
+
+    def pack_json(self, base, sha):
+        return json.loads((self.pack_folder(base, sha) / "pack.json").read_text(encoding="utf-8"))
+
+    def pack_record_text(self, base, sha, job, dirty, renderer):
+        fields = [("closure", CLOSURE), ("sha", sha), ("base", base), ("dirty", dirty), ("hookshot_vk.so", renderer),
+                  ("build_s", str(self.pack_json(base, sha)["build_s"])), ("pack", str(self.pack_folder(base, sha))),
+                  ("job", job)]
+        return "".join("%s: %s\n" % field for field in fields)
+
+    def assert_pack_record(self, proc, base, sha, renderer, diff=b""):
+        job = self.only_job()
+        dirty = sha256(diff) if diff else "none"
+        head = self.pack_record_text(base, sha, job, dirty, renderer).encode("utf-8")
+        self.assertEqual(proc.stdout, head + diff)
+        self.assertEqual(proc.stderr, b"")
+        self.assertEqual((self.pack_dir(base, sha) / "build.txt").read_bytes(), head)
+        self.assertEqual((self.pack_dir(base, sha) / "dirty.diff").exists(), bool(diff))
+        if diff:
+            self.assertEqual((self.pack_dir(base, sha) / "dirty.diff").read_bytes(), diff)
+
+    def assert_refused_before_the_host(self, proc):
+        self.assertExit(proc, 2)
+        for tool in ("devenv", "ssh", "nix", "nix-store", "systemd-run"):
+            self.assertEqual(self.calls(tool), [], tool)
+
+    def test_r1_pack_a_renderer_change_is_built_over_the_base_in_one_job_and_recorded(self):
+        base = self.build_base()
+        sha = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        proc = self.run_pack(sha, base)
+        self.assertExit(proc, 0)
+        self.assertEqual((self.pack_folder(base, sha) / "hookshot_vk.so").read_bytes(), STAND_IN_PACK_RENDERER)
+        meta = self.pack_json(base, sha)
+        self.assertEqual((meta["base"], meta["head"], meta["route"]), (base, sha, "renderer"))
+        self.assertEqual(meta["files"], {"hookshot_vk.so": sha256(STAND_IN_PACK_RENDERER)})
+        self.assert_pack_record(proc, base, sha, renderer=sha256(STAND_IN_PACK_RENDERER))
+
+    def test_r1_pack_the_job_runs_the_in_pack_half_through_the_closure_entry(self):
+        base = self.build_base()
+        sha = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        proc = self.run_pack(sha, base)
+        self.assertExit(proc, 0)
+        job = self.only_job()
+        (run,) = self.calls("systemd-run")
+        hx = self.root / "jobs" / job / "tools" / "scripts" / "harness" / "hx.py"
+        argv = [str(self.enter), CLOSURE, "python", "-I", str(hx), "build", "--in-pack", str(self.base_dir(base)), sha]
+        self.assertEqual(run[-len(argv):], argv)
+        self.assertIn("--working-directory=%s" % (self.root / "jobs" / job), run)
+
+    def test_r1_pack_the_change_is_built_from_a_worktree_of_its_commit_in_the_bases_source(self):
+        base = self.build_base()
+        sha = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        proc = self.run_pack(sha, base)
+        self.assertExit(proc, 0)
+        tree = self.base_dir(base) / "trees" / sha
+        self.assertEqual(self.git("rev-parse", "HEAD", cwd=tree).strip(), sha)
+        self.assertEqual(self.pack_json(base, sha)["tree"], str(tree))
+
+    def test_r1_pack_the_bundle_holds_only_the_history_after_the_base_and_this_checkout_gains_no_ref(self):
+        base = self.build_base()
+        sha = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        refs = self.git("for-each-ref", "--format=%(refname) %(objectname)")
+        proc = self.run_pack(sha, base)
+        self.assertExit(proc, 0)
+        self.assertEqual(self.git("for-each-ref", "--format=%(refname) %(objectname)"), refs)
+        header = (self.pack_dir(base, sha) / BUNDLE_NAME).read_bytes().split(b"\n\n", 1)[0].split(b"\n")
+        prerequisites = [line.split(b" ", 1)[0] for line in header if line.startswith(b"-")]
+        self.assertEqual(prerequisites, [b"-" + base.encode("ascii")])
+
+    def test_r1_pack_a_dirty_checkout_prints_the_diffs_sha256_and_the_diff_and_keeps_the_diff(self):
+        base = self.build_base()
+        sha = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        self.write_notes("changed\n")
+        diff = self.working_diff()
+        self.assertIn(b"+changed", diff)
+        proc = self.run_pack(sha, base)
+        self.assertExit(proc, 0)
+        self.assert_pack_record(proc, base, sha, renderer=sha256(STAND_IN_PACK_RENDERER), diff=diff)
+
+    def test_r1_pack_the_renderer_hash_is_the_bases_when_no_module_differs(self):
+        base = self.build_base()
+        # the base kept its renderer's link list and its object, and the pack's object is the same: no module differs
+        work = self.base_dir(base) / "work" / "sa" / "build"
+        work.mkdir(parents=True)
+        (work / "vk_obj.o").write_bytes(STAND_IN_OBJECT)
+        (work / "vk_objs.rsp").write_text('"%s"\n' % (work / "vk_obj.o"), encoding="utf-8")
+        sha = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        proc = self.run_pack(sha, base)
+        self.assertExit(proc, 0)
+        self.assertEqual(self.pack_json(base, sha)["files"], {})
+        self.assertFalse((self.pack_folder(base, sha) / "hookshot_vk.so").exists())
+        base_json = json.loads((self.base_dir(base) / "base.json").read_text(encoding="utf-8"))
+        self.assertNotEqual(base_json["modules"]["hookshot_vk.so"], sha256(STAND_IN_PACK_RENDERER))
+        self.assert_pack_record(proc, base, sha, renderer=base_json["modules"]["hookshot_vk.so"])
+
+    def test_r1_pack_a_host_change_is_refused_before_the_host_naming_its_file(self):
+        base = self.head()
+        sha = self.commit("host", {"host/host_view.c": '#include "../gpu/vk/vk_shared.h"\n// second\n'})
+        proc = self.run_pack(sha, base)
+        self.assert_refused_before_the_host(proc)
+        self.assertIn(b"host/host_view.c", proc.stderr)
+
+    def test_r1_pack_a_gpu_vk_file_that_host_includes_is_refused_naming_only_that_file(self):
+        base = self.head()
+        sha = self.commit("header", {"gpu/vk/vk_shared.h": "shared second\n", "gpu/vk/vk_draw.cpp": "draw second\n"})
+        proc = self.run_pack(sha, base)
+        self.assert_refused_before_the_host(proc)
+        self.assertIn(b"gpu/vk/vk_shared.h", proc.stderr)
+        self.assertNotIn(b"gpu/vk/vk_draw.cpp", proc.stderr)
+
+    def test_r1_pack_a_docs_only_change_is_refused_as_nothing_a_module_is_built_from(self):
+        base = self.head()
+        sha = self.commit("docs", {"docs/notes.md": "notes\n"})
+        proc = self.run_pack(sha, base)
+        self.assert_refused_before_the_host(proc)
+        self.assertIn(b"nothing a module is built from changed", proc.stderr)
+
+    def test_r1_pack_a_base_that_is_no_ancestor_of_the_change_is_refused_before_the_host(self):
+        first = self.head()
+        second = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        proc = self.run_pack(first, second)
+        self.assert_refused_before_the_host(proc)
+        self.assertIn(("%s is not built on the base %s" % (first[:8], second[:8])).encode("ascii"), proc.stderr)
+
+    def test_r1_pack_an_unknown_rev_or_base_returns_2_before_anything_reaches_the_host(self):
+        sha = self.head()
+        for rev, on in (("no-such-revision", sha), (sha, "no-such-revision")):
+            with self.subTest(rev=rev, on=on):
+                proc = self.run_pack(rev, on)
+                self.assert_refused_before_the_host(proc)
+                self.assertIn(b"no-such-revision", proc.stderr)
+
+    def test_r1_pack_needs_the_on_base_and_returns_2(self):
+        sha = self.head()
+        for argv in (("--pack", sha), ("--pack", sha, "--on"), ("--pack", "--on", sha)):
+            with self.subTest(argv=argv):
+                proc = self.run_build(*argv)
+                self.assert_refused_before_the_host(proc)
+                self.assertIn(b"--on", proc.stderr)
+
+    def test_r1_pack_a_base_never_built_exits_1_before_any_job(self):
+        base = self.head()
+        sha = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        proc = self.run_pack(sha, base)
+        self.assertExit(proc, 1)
+        self.assertIn(b"no kept base", proc.stderr)
+        self.assertEqual(self.calls("systemd-run"), [])
+        self.assertFalse((self.base_dir(base) / "hx-packs").exists())
+
+    def test_r1_pack_a_pack_json_naming_another_head_exits_1_with_no_record(self):
+        base = self.build_base()
+        sha = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        # the folder the pack would be built in holds the base's commit already, so the pack names that commit as its head
+        self.git("worktree", "add", "--detach", str(self.base_dir(base) / "trees" / sha), base,
+                 cwd=self.base_dir(base) / "src")
+        proc = self.run_pack(sha, base)
+        self.assertExit(proc, 1)
+        self.assertIn(("names base %s, head %s" % (base, base)).encode("ascii"), proc.stderr)
+        self.assertFalse((self.pack_dir(base, sha) / "build.txt").exists())
+        self.assertFalse((self.pack_dir(base, sha) / "dirty.diff").exists())
+
+    def test_r1_pack_a_failing_pack_step_stops_the_job_and_prints_its_status_and_console_log(self):
+        base = self.build_base()
+        sha = self.commit("renderer", {"gpu/vk/vk_draw.cpp": "draw second\n"})
+        os.environ["HX_BUILD_STATUS"] = "3"
+        proc = self.run_pack(sha, base)
+        self.assertExit(proc, 1)
+        console = self.pack_dir(base, sha) / "console.log"
+        lines = console.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[-1], "hx build --pack: scripts/dev_packs.py pack failed: exit status 1")
+        self.assertEqual(proc.stdout.decode("utf-8").splitlines(),
+                         ["build failed: exit status 1; log: %s" % console] + lines[-20:])
+        self.assertFalse((self.pack_dir(base, sha) / "build.txt").exists())
 
 
 if __name__ == "__main__":
