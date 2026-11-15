@@ -58,7 +58,7 @@ def main():
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"
         cpp.write_text(fixture, encoding="utf-8")
         subprocess.run([a.cxx, "-std=c++20", "-include", ENV_ON_H, "-O1", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers",
-                        "-pthread", "-I" + str(a.headers),
+                        "-pthread", "-I" + str(a.headers), "-I" + str(a.source / "gpu/vk"),
                         *(["-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-pie", "-no-pie"] if a.sanitize else []),
                         str(cpp), "-o", str(exe)], check=True)
         for route in ["id", "make", "cache-off"]:

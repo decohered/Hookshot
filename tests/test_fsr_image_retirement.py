@@ -31,7 +31,7 @@ def main():
             cpp = Path(tmp) / (backend + ".cpp")
             exe = Path(tmp) / (backend + (".exe" if os.name == "nt" else ".test"))
             cpp.write_text(code, encoding="utf-8")
-            subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers", "-I" + args.headers, str(cpp), "-o", str(exe)], check=True)
+            subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", "-Wno-missing-field-initializers", "-I" + args.headers, "-I" + str(ROOT / "gpu/vk"), str(cpp), "-o", str(exe)], check=True)
             for case in ["pending", "resumed", "post-present", "batch", "completed", "several", "out-of-order", "empty", "no-timeline", "overflow", "queue-serial", "queue-batch", "queue-parallel", "queue-post-present"]:
                 subprocess.run([str(exe), case], check=True)
                 print(backend, case, "passed", flush=True)
