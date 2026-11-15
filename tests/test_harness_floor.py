@@ -1,18 +1,18 @@
 """scripts/harness/hx_floor.py (hx floor): one device's noise floor for one scene, measured as one bench job. Fakes only: ssh,
-the job, the subprocesses, the game, the bridge and the journal are stand-ins, and the numbers and PNGs are synthetic; no
-game, GPU or host is read. The in-job test takes the scene from the real parser but supplies the suite's bytes and its
-load itself, because scenes.parse refuses a top-level [method] table (scenes.py, _known); the method is read from the
-same bytes by verdict.load_method, which ignores the other tables.
+the job, the subprocesses, the game, the bridge and the journal are stand-ins, and the numbers are synthetic; no game, GPU
+or host is read. The in-job test takes the scene from the real parser but supplies the suite's bytes and its load itself,
+because scenes.parse refuses a top-level [method] table (scenes.py, _known); the method is read from the same bytes by
+verdict.load_method, which ignores the other tables.
 
 - R1: run_argv is hx run --in-job's argv in the build's closure with the device's environment pairs in order; the client
   starts one bench job whose argv runs the in-job half, and refuses a bad method before any job starts; resolve refuses a
   build whose build.txt lacks a line or names another commit; launch returns a run's status and its id; correctness_argv
   is the argv that the in-job correctness parser reads back; the validation layer is used only when vulkaninfo lists it;
-  correctness_run takes three screenshots, sixty presents apart, and records them with the run's files; the series plans
-  A-B-B-A, launches each run once through its arm's closure, removes each game folder, and stops at the first run that
-  does not pass; run_frames, run_log and run_shots read the record back and refuse a changed or missing file; a complete
-  floor and a failed floor each write one record run that hx verify accepts, a complete one with its floor, interval,
-  medians, image tolerance and determinism, and a void baseline fails it.
+  correctness_run takes no screenshot (DL185): it connects to the game for no shot, and records its files with no
+  screenshots; the series plans A-B-B-A, launches each run once through its arm's closure, removes each game folder, and
+  stops at the first run that does not pass; run_frames and run_log read the record back and refuse a changed or missing
+  file; a complete floor and a failed floor each write one record run that hx verify accepts, a complete one with its
+  floor, interval and medians and no image, and a void baseline (a flash or a new validation error in B) fails it.
 - R4: a hold pauses the series, and the seconds it waited show on the entry of the run it came before.
 
 python -I -B tests/test_harness_floor.py
@@ -25,13 +25,11 @@ import json
 import os
 import shutil
 import stat
-import struct
 import subprocess
 import sys
 import tempfile
 import types
 import unittest
-import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -60,6 +58,7 @@ EXPECT = "Example GPU"
 DEVICE_ENV = {"EXAMPLE_FLAG": "1"}
 JOB_ID = "bench-20261113T000000Z-abcdef"
 FRAMES = 60
+FIRST_FRAME = 1000   # the game.frame of a stand-in window's first status
 HASHES = "%s  hookshot\n%s  hookshot_vk.so\n" % ("a" * 64, "b" * 64)
 
 METHOD_TABLE = """[method]
@@ -76,7 +75,7 @@ cache = "cold"
 motion = "still"
 save = "start"
 route = [{ teleport = 0 }]
-seconds = 1
+seconds = 2
 
 [scenes.medium]
 kind = "medium"
@@ -130,26 +129,6 @@ PLAN = [("A", "timed"), ("B", "timed"), ("B", "timed"), ("A", "timed"), ("A", "t
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
-
-
-def chunk(kind, body):
-    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
-
-
-def png(rows):
-    """An 8-bit RGB PNG of rows, each a list of (r, g, b) tuples of one length"""
-    height, width = len(rows), len(rows[0])
-    raw = b"".join(b"\x00" + bytes(channel for pixel in row for channel in pixel) for row in rows)
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
-
-
-def solid(value):
-    return png([[(value, value, value)] * 2 for _ in range(2)])
-
-
-SHOT_A = solid(10)
-SHOT_B = solid(200)
 
 
 def frame_csv(values):
@@ -211,9 +190,9 @@ class RecordCase(unittest.TestCase):
         self.addCleanup(p.stop)
         return mocked
 
-    def write_run(self, files, shots=None):
+    def write_run(self, files):
         facts = {key: {"value": key} for key in record.FACT_KEYS}
-        run_id, _ = record.write_run(self.results, facts, files, shots or {}, journal=self.lines.append)
+        run_id, _ = record.write_run(self.results, facts, files, {}, journal=self.lines.append)
         return run_id
 
     def run_manifest(self, run_id):
@@ -397,7 +376,7 @@ class CorrectnessTest(RecordCase):
         os.makedirs(os.path.join(self.root, "scenes"))
         with open(os.path.join(self.root, "scenes", "suite.toml"), "wb") as f:
             f.write(SCENES_ONLY)
-        self.requests = []
+        self.requests, self.connections = [], []
         self.started = []
         self.played = []
         self.patch(hx_run, "copy_game", side_effect=fake_copy)
@@ -405,15 +384,13 @@ class CorrectnessTest(RecordCase):
         self.patch(hx_run, "kernel_text", return_value=None)
 
     def fake_game(self, outputs=None):
-        requests = self.requests
+        """The game on its connection: each connection and each request on it is recorded, and no request is answered
+        with anything but ok, so a correctness run that asked the game for a shot would show it."""
+        requests, connections = self.requests, self.connections
 
         class FakeConn:
             def request(self, cmd, **args):
                 requests.append((cmd, args))
-                if cmd == "shot":
-                    with open(args["path"], "wb") as f:
-                        f.write(SHOT_A)
-                    return {"ok": True, "path": args["path"]}
                 return {"ok": True}
 
             def close(self):
@@ -421,6 +398,7 @@ class CorrectnessTest(RecordCase):
 
         class FakeGame:
             def connect(self):
+                connections.append(True)
                 return FakeConn()
 
             def quit(self, timeout=60):
@@ -437,7 +415,8 @@ class CorrectnessTest(RecordCase):
 
     def play(self, running, scene, expect):
         self.played.append((scene.name, expect))
-        return {"replayed": 1}, {"replayed": FRAMES}, "Area"
+        return ({"replayed": 1, "game": {"frame": FIRST_FRAME}},
+                {"replayed": FRAMES, "game": {"frame": FIRST_FRAME + 2 * 60}}, "Area")
 
     def correct(self, start=None, play=None):
         self.game = self.fake_game()
@@ -445,18 +424,13 @@ class CorrectnessTest(RecordCase):
                                         start=start or self.start, play=play or self.play, machine=lambda: {},
                                         journal=self.lines.append)
 
-    def test_a_pass_takes_three_shots_sixty_presents_apart_and_records_them_with_the_run(self):
+    def test_a_pass_takes_no_shot_and_records_its_files_with_no_screenshots(self):
         (status, run_id), _, _ = run_quietly(self.correct)
         self.assertEqual((status, run_id), (0, "000001"))
-        expected = []
-        for number in (1, 2, 3):
-            expected.append(("wait", {"event": "present", "frames": 60, "timeout": hx_run.WAIT_SECONDS}))
-            expected.append(("shot", {"path": os.path.join(self.sub, "run", "shot_%d.png" % number),
-                                      "timeout": hx_run.WAIT_SECONDS}))
-        self.assertEqual(self.requests, expected)
+        self.assertEqual(self.connections, [])
+        self.assertEqual(self.requests, [])
         manifest = self.run_manifest(run_id)
-        self.assertEqual(sorted(manifest["screenshots"]), ["shot_1.png", "shot_2.png", "shot_3.png"])
-        self.assertEqual(manifest["screenshots"]["shot_1.png"]["sha256"], sha(SHOT_A))
+        self.assertEqual(manifest["screenshots"], {})
         self.assertEqual(sorted(manifest["files"]),
                          ["frametimes.csv", "log.txt", "metrics.json", "scene.json", "suite.toml"])
         self.assertEqual(manifest["facts"]["suite_sha256"], sha(SCENES_ONLY))
@@ -659,7 +633,7 @@ class ReadBackTest(RecordCase):
         self.values = [float(n) for n in range(1, FRAMES + 1)]
         files = timed_files()
         files["frametimes.csv"] = frame_csv(self.values)
-        self.run_id = self.write_run(files, {"shot_1.png": SHOT_A, "shot_2.png": SHOT_B})
+        self.run_id = self.write_run(files)
 
     def set_bytes(self, path, data):
         (self.results / path).write_bytes(data)
@@ -684,12 +658,6 @@ class ReadBackTest(RecordCase):
         run_id = self.write_run(timed_files(log=b"vk: flash at present 4\n"))
         self.assertEqual(hx_floor.run_log(self.results, run_id), "vk: flash at present 4\n")
 
-    def test_run_shots_are_the_screenshots_by_name_in_the_record(self):
-        shots = hx_floor.run_shots(self.results, self.run_id)
-        self.assertEqual(sorted(shots), ["shot_1.png", "shot_2.png"])
-        self.assertEqual(shots["shot_1.png"].read_bytes(), SHOT_A)
-        self.assertEqual(shots["shot_2.png"].read_bytes(), SHOT_B)
-
     def test_a_changed_frame_log_is_refused(self):
         self.set_bytes("runs/%s/files/frametimes.csv" % self.run_id, frame_csv([99.0] * FRAMES))
         with self.assertRaisesRegex(hx_floor.FloorError, "does not match"):
@@ -699,16 +667,6 @@ class ReadBackTest(RecordCase):
         (self.results / "runs" / self.run_id / "files" / "log.txt").unlink()
         with self.assertRaisesRegex(hx_floor.FloorError, "cannot be read"):
             hx_floor.run_log(self.results, self.run_id)
-
-    def test_a_changed_screenshot_is_refused(self):
-        self.set_bytes("screenshots/" + sha(SHOT_B), SHOT_A)
-        with self.assertRaisesRegex(hx_floor.FloorError, "does not match"):
-            hx_floor.run_shots(self.results, self.run_id)
-
-    def test_a_missing_screenshot_is_refused(self):
-        (self.results / "screenshots" / sha(SHOT_A)).unlink()
-        with self.assertRaisesRegex(hx_floor.FloorError, "cannot be read"):
-            hx_floor.run_shots(self.results, self.run_id)
 
 
 class WriteVerdictTest(RecordCase):
@@ -733,8 +691,8 @@ class WriteVerdictTest(RecordCase):
 
 
 class InJobTest(RecordCase):
-    """The in-job half end to end: the real series and the real measurement, with the runs and the shots faked and their
-    records written for real. The scene is the real parse of the scenes, its load supplied here (see the docstring)."""
+    """The in-job half end to end: the real series and the real measurement, with the runs faked and their records written
+    for real. The scene is the real parse of the scenes, its load supplied here (see the docstring)."""
 
     def setUp(self):
         super().setUp()
@@ -746,7 +704,7 @@ class InJobTest(RecordCase):
         parsed = scenes.parse(SCENES_ONLY, "suite.toml")
         self.suite = scenes.Suite(path="suite.toml", sha256=sha(SUITE_WITH_METHOD), scenes=parsed.scenes)
         self.scene = parsed.scenes["light"]
-        self.statuses, self.logs, self.correct_shots = {}, {}, {}
+        self.statuses, self.logs = {}, {}
         self.timed_argvs = []
         self.patch(hx_run, "load_scene",
                    side_effect=lambda root, name, final: (self.suite_bytes, self.suite, self.scene))
@@ -761,7 +719,8 @@ class InJobTest(RecordCase):
                    side_effect=lambda *args: real_write(*args, journal=self.lines.append))
 
     def launch(self, argv):
-        """A run's launch as a fake: a timed run writes its record run, a correctness run writes its record run with shots"""
+        """A run's launch as a fake: a timed run writes its record run, and a correctness run writes its record run with its
+        log and no screenshot"""
         if "--in-job" in argv:
             sub = argv[argv.index("--in-job") + 1]
             index = int(os.path.basename(sub))
@@ -772,8 +731,7 @@ class InJobTest(RecordCase):
         sub = argv[argv.index("--correctness-in-job") + 1]
         index = int(os.path.basename(sub))
         os.makedirs(os.path.join(sub, "game"))
-        shots = self.correct_shots.get(index, {"shot_1.png": SHOT_A, "shot_2.png": SHOT_A, "shot_3.png": SHOT_A})
-        run_id = self.write_run(timed_files(log=self.logs.get(index, b"vk: ok\n")), shots)
+        run_id = self.write_run(timed_files(log=self.logs.get(index, b"vk: ok\n")))
         return self.statuses.get(index, 0), run_id
 
     def argv(self):
@@ -788,7 +746,7 @@ class InJobTest(RecordCase):
     def latest(self):
         return record.run_ids(self.results)[-1]
 
-    def test_a_complete_floor_is_recorded_with_its_floor_tolerance_and_determinism(self):
+    def test_a_complete_floor_is_recorded_with_its_floor_and_no_image(self):
         status, out, _ = run_quietly(hx_floor.main, self.argv())
         self.assertEqual(status, 0)
         run_id = self.latest()
@@ -812,20 +770,11 @@ class InJobTest(RecordCase):
         self.assertLessEqual(low, high)
         self.assertEqual(len(payload["a_medians"]), 5)
         self.assertEqual(len(payload["b_medians"]), 5)
-        self.assertEqual(payload["image"]["metric"], "pixel")
-        self.assertEqual(payload["image"]["tolerance"], 0.0)
-        self.assertEqual(payload["image"]["determinism"], "deterministic")
+        self.assertNotIn("image", payload)
         self.assertEqual(self.run_manifest(run_id)["facts"], self.run_manifest("000001")["facts"])
-        self.assertEqual(self.hx_verify_problems(), [])
-
-    def test_nondeterministic_shots_are_recorded_with_their_tolerance_and_do_not_void_the_floor(self):
-        self.correct_shots[11] = {"shot_1.png": SHOT_A, "shot_2.png": SHOT_B, "shot_3.png": SHOT_A}
-        status, _, _ = run_quietly(hx_floor.main, self.argv())
-        self.assertEqual(status, 0)
-        image = self.floor(self.latest())["image"]
-        self.assertEqual(image["determinism"], "nondeterministic")
-        self.assertGreater(image["tolerance"], 0)
-        self.assertEqual(image["shots"]["shot_2.png"], image["tolerance"])
+        for entry in payload["series"]:
+            if entry["kind"] == "correctness":
+                self.assertEqual(self.run_manifest(entry["run"])["screenshots"], {}, entry["arm"])
         self.assertEqual(self.hx_verify_problems(), [])
 
     def test_a_flash_in_a_baseline_log_voids_the_floor_and_the_record_says_so(self):
@@ -835,8 +784,18 @@ class InJobTest(RecordCase):
         payload = self.floor(self.latest())
         self.assertEqual(payload["outcome"], "failed")
         self.assertIn("flash", payload["reason"])
-        for key in ("floor", "interval", "a_medians", "b_medians", "image"):
+        for key in ("floor", "interval", "a_medians", "b_medians"):
             self.assertIsNone(payload[key], key)
+        self.assertNotIn("image", payload)
+        self.assertEqual(self.hx_verify_problems(), [])
+
+    def test_a_new_validation_error_in_the_b_baseline_voids_the_floor(self):
+        self.logs[11] = b"Validation Error: [ VUID-vkCmdDraw-None-0001 ] draw\n"
+        status, _, _ = run_quietly(hx_floor.main, self.argv())
+        self.assertEqual(status, 1)
+        payload = self.floor(self.latest())
+        self.assertEqual(payload["outcome"], "failed")
+        self.assertIn("validation error VUID-vkCmdDraw-None-0001 in correctness log b", payload["reason"])
         self.assertEqual(self.hx_verify_problems(), [])
 
     def test_a_failed_timed_run_stops_the_series_and_records_a_failed_floor(self):
@@ -848,7 +807,7 @@ class InJobTest(RecordCase):
         self.assertIn("run 3", payload["reason"])
         self.assertEqual([e["index"] for e in payload["series"]], [0, 1, 2, 3])
         self.assertIsNone(payload["floor"])
-        self.assertIsNone(payload["image"])
+        self.assertNotIn("image", payload)
         self.assertEqual(len(self.timed_argvs), 4)
         self.assertEqual(self.hx_verify_problems(), [])
 

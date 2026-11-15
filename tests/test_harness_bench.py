@@ -1,24 +1,23 @@
 """scripts/harness/hx_bench.py (hx bench): the A-B-B-A series of two builds as one bench job, judged against a recorded
 floor of the same device, scene and method, and recorded as one bench record run. Fakes only: ssh, the job, the
-subprocesses, the game, the bridge and the journal are stand-ins, and the numbers and PNGs are synthetic; no game, GPU or
-host is read. The in-job test takes the scene from the real parser but supplies the suite's bytes and its load itself,
-because scenes.parse refuses a top-level [method] table (scenes.py, _known); the method is read from the same bytes by
-verdict.load_method.
+subprocesses, the game, the bridge and the journal are stand-ins, and the numbers are synthetic; no game, GPU or host is
+read. The in-job test takes the scene from the real parser but supplies the suite's bytes and its load itself, because
+scenes.parse refuses a top-level [method] table (scenes.py, _known).
 
 - R2: hx bench runs the floor's series, A-B-B-A with each run once, and calls it slower, faster or no change against the
   floor's noise floor: a planted slower, faster and identical series each get their call, and a change inside the floor
   is no change. The client job's argv carries both closures, the device, the scene and --floor, and the in-job parser
-  reads it back.
-- R3: images past the floor's tolerance, a flash, a new validation error, a hang or shots of different sizes void the
-  bench with no verdict, each cause alone; a shot within the tolerance, or a validation error both builds share, does not
-  void it. A run that fails, or prints no run id, is recorded failed, and a run is not rerun.
+  reads it back. A floor recorded with no image is accepted.
+- R3 (DL185): a flash, a new validation error in B or a hang void the bench with no verdict, each cause alone; a
+  validation error both builds share does not void it. The correctness runs' pictures decide nothing: pictures that
+  differ, or differ in size, leave the bench judged by its timing. A run that fails, or prints no run id, is recorded
+  failed, and a run is not rerun.
 - R4: a hold during the series shows on the entry of the run it precedes, and the verdict is the verdict without the hold.
 - A floor of another device, scene or method, or one that is not a recorded floor, is refused before any run. Every bench
   record passes hx_verify's check.
 
 python -I -B tests/test_harness_bench.py
 """
-import argparse
 import contextlib
 import hashlib
 import io
@@ -46,7 +45,6 @@ import jobs
 import record
 import runrecord
 import scenes
-import verdict
 
 HOST = "example-host"
 SHA = "3f9c2a1b7d4e6f80a1b2c3d4e5f60718293a4b5c"
@@ -59,8 +57,6 @@ DEVICE_ENV = {"EXAMPLE_FLAG": "1"}
 JOB_ID = "bench-20261113T000000Z-abcdef"
 FRAMES = 60
 FLOOR = 0.02
-FLOOR_IMAGE = {"metric": "pixel", "tolerance": 0.0, "determinism": "deterministic",
-               "shots": {"shot_1.png": 0.0, "shot_2.png": 0.0, "shot_3.png": 0.0}}
 METHOD_DICT = {"confidence": 0.95, "runs_per_arm": 5, "warmup_seconds": 0.0, "resamples": 200, "seed": 7}
 
 METHOD_TABLE = """[method]
@@ -124,7 +120,6 @@ seconds = 1800
 """
 SCENES_ONLY = SCENES.encode("utf-8")
 SUITE_WITH_METHOD = (METHOD_TABLE + SCENES).encode("utf-8")
-METHOD = verdict.load_method(SUITE_WITH_METHOD, "suite.toml")
 PLAN = [("A", "timed"), ("B", "timed"), ("B", "timed"), ("A", "timed"), ("A", "timed"), ("B", "timed"),
         ("B", "timed"), ("A", "timed"), ("A", "timed"), ("B", "timed"), ("A", "correctness"), ("B", "correctness")]
 
@@ -255,7 +250,7 @@ class BenchCase(unittest.TestCase):
             "kind": "floor", "outcome": "recorded", "reason": None, "device": DEVICE, "expect": EXPECT,
             "scene": "light", "a_sha": SHA, "b_sha": SHA, "suite_sha256": sha(SUITE_WITH_METHOD),
             "method": dict(METHOD_DICT), "validation": False, "series": [], "floor": FLOOR,
-            "interval": [-0.01, 0.01], "a_medians": [16.5] * 5, "b_medians": [16.5] * 5, "image": dict(FLOOR_IMAGE),
+            "interval": [-0.01, 0.01], "a_medians": [16.5] * 5, "b_medians": [16.5] * 5,
         }
         payload.update(changes)
         return payload
@@ -286,8 +281,7 @@ class BenchCase(unittest.TestCase):
         self.launched.append(index)
         self.argvs[index] = argv
         os.makedirs(os.path.join(sub, "game"))
-        shots = self.correct_shots.get(index, {"shot_1.png": SHOT_A, "shot_2.png": SHOT_A, "shot_3.png": SHOT_A})
-        run_id = self.write_run(timed_files(log=self.logs.get(index, b"vk: ok\n")), shots)
+        run_id = self.write_run(timed_files(log=self.logs.get(index, b"vk: ok\n")), self.correct_shots.get(index))
         return self.statuses.get(index, 0), run_id
 
     def bench(self, scene="light", device=DEVICE):
@@ -353,7 +347,7 @@ class VerdictTest(BenchCase):
         self.assertEqual(payload["method"], METHOD_DICT)
         self.assertEqual(payload["floor_run"], self.floor_run)
         self.assertEqual(payload["floor"], FLOOR)
-        self.assertEqual(payload["image"], FLOOR_IMAGE)
+        self.assertNotIn("image", payload)
         self.assertFalse(payload["validation"])
         self.assertEqual(self.record_file(run_id, "suite.toml"), SUITE_WITH_METHOD)
         self.assertEqual(self.hx_verify_problems(), [])
@@ -408,18 +402,16 @@ class VerdictTest(BenchCase):
         self.assertEqual(self.run_manifest(run_id)["facts"], self.run_manifest(first)["facts"])
         self.assertNotEqual(first, self.floor_run)
 
-    def test_a_shot_past_the_tolerance_voids_the_bench_with_no_verdict(self):
-        self.correct_shots[11] = {"shot_1.png": SHOT_A, "shot_2.png": SHOT_B, "shot_3.png": SHOT_A}
-        status, out, _ = self.bench()
-        self.assertVoid(status, out, ["screenshots beyond the tolerance 0.0 (pixel): shot_2.png"])
-
-    def test_a_shot_within_the_tolerance_does_not_void_the_bench(self):
-        self.floor_run = self.record_floor(image={**FLOOR_IMAGE, "tolerance": 0.8})
-        self.correct_shots[11] = {"shot_1.png": SHOT_A, "shot_2.png": SHOT_B, "shot_3.png": SHOT_A}
-        status, out, _ = self.bench()
-        self.assertEqual(status, 0)
-        self.assertIn("verdict: no change", out)
-        self.assertEqual(self.hx_verify_problems(), [])
+    def test_correctness_pictures_that_differ_do_not_void_the_bench_and_the_timing_decides(self):
+        self.frame_ms = {"A": 16.5, "B": 18.15}
+        for label, other in (("another colour", SHOT_B), ("another size", SHOT_WIDER)):
+            with self.subTest(label):
+                self.correct_shots = {10: {"shot_1.png": SHOT_A}, 11: {"shot_1.png": other}}
+                status, out, _ = self.bench()
+                self.assertEqual(status, 0)
+                self.assertIn("verdict: slower", out)
+                self.assertEqual(self.payload(self.latest())["void_reasons"], [])
+                self.assertEqual(self.hx_verify_problems(), [])
 
     def test_a_flash_in_the_correctness_log_of_b_voids_the_bench(self):
         self.logs[11] = b"vk: flash at present 12\n"
@@ -452,19 +444,6 @@ class VerdictTest(BenchCase):
         self.assertTrue(payload["void_reasons"][0].startswith("hang in timed log "), payload["void_reasons"])
         self.assertTrue(payload["void_reasons"][0].endswith("1 line(s), first: vk: GPU hang: queue 0"),
                         payload["void_reasons"])
-        for key in ("interval", "a_medians", "b_medians"):
-            self.assertIsNone(payload[key], key)
-        self.assertEqual(self.hx_verify_problems(), [])
-
-    def test_shots_of_different_sizes_void_the_bench_and_the_reason_names_them(self):
-        self.correct_shots[11] = {"shot_1.png": SHOT_A, "shot_2.png": SHOT_WIDER, "shot_3.png": SHOT_A}
-        status, out, _ = self.bench()
-        self.assertEqual(status, 1)
-        self.assertIn("verdict: void", out)
-        payload = self.payload(self.latest())
-        self.assertEqual(payload["outcome"], "void")
-        self.assertEqual(len(payload["void_reasons"]), 1)
-        self.assertIn("different sizes", payload["void_reasons"][0])
         for key in ("interval", "a_medians", "b_medians"):
             self.assertIsNone(payload[key], key)
         self.assertEqual(self.hx_verify_problems(), [])
@@ -549,10 +528,6 @@ class RefusalTest(BenchCase):
     def test_a_floor_with_no_noise_floor_is_refused(self):
         self.floor_run = self.record_floor(floor=None)
         self.refused("no noise floor")
-
-    def test_a_floor_whose_image_names_no_metric_or_tolerance_is_refused(self):
-        self.floor_run = self.record_floor(image={"shots": {}})
-        self.refused("no image with a metric and tolerance")
 
 
 class ArgvTest(unittest.TestCase):

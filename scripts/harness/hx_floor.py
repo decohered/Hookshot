@@ -1,12 +1,12 @@
 """hx floor: one device's noise floor for one scene, measured as one bench job. The method's A-B-B-A plan (verdict.plan) runs
 with one build in both arms: each timed run is an hx run --in-job in the build's closure, and each arm adds one correctness
-run (screenshots, and the validation layer when vulkaninfo on the host lists it). The series waits for the hold before every
-run and stops at the first run that does not pass; nothing is rerun. The floor, the image tolerance and the determinism
-label are recorded as one record run (floor.json) whose facts are the first run's.
+run (the validation layer when vulkaninfo on the host lists it; no screenshot, DL185). The series waits for the hold before
+every run and stops at the first run that does not pass; nothing is rerun. The floor is recorded as one record run
+(floor.json) whose facts are the first run's.
 
     hx floor --device D --scene S [--build REV]
 
-Exit status: 0 the floor is recorded; 1 the floor failed (recorded: a run did not pass, a run's frames or shots cannot be read
+Exit status: 0 the floor is recorded; 1 the floor failed (recorded: a run did not pass, a run's frames or log cannot be read
 back, or the baseline is void); 2 the floor could not run (an unknown device, scene or build, a suite or method that is
 refused, a job that will not start, a record that is not written). The client returns the job's status; 255 is ssh lost, and
 the job goes on.
@@ -31,7 +31,6 @@ import sys
 import time
 from pathlib import Path
 
-import bridge
 import config
 import game
 import gate
@@ -45,14 +44,12 @@ import runrecord
 import scenes
 import verdict
 
-SHOTS = 3
-SHOT_PRESENTS = 60
 TIMED_ENV = {"HOS_NO_PACING": "1"}
 VALIDATION_ENV = {"RX_VK_VALIDATION": "1"}
 VALIDATION_LAYER = "VK_LAYER_KHRONOS_validation"
 FLOOR_FILE = "floor.json"
 ARMS = ("A", "B")
-MEASURED = ("floor", "interval", "a_medians", "b_medians", "image")
+MEASURED = ("floor", "interval", "a_medians", "b_medians")
 RUN_LINE = re.compile(r"run: ([0-9]{6})")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -233,9 +230,9 @@ def validation_available(run=subprocess.run):
 def correctness_run(sub_job, root, build_folder, device, expect, env, scene_name, start=game.start, play=hx_run.play,
                     machine=runrecord.machine_outputs, journal=record.write_journal):
     """hx run's in-job flow for one correctness run: the build's game copied into the sub-job (no warm copy is made), started
-    with the scene's save and slot and env, played, and its window held; then SHOTS screenshots, each after SHOT_PRESENTS
-    presents, written under the sub-job's run/ folder. The run is recorded with hx run's files and the screenshots. Returns
-    its status (0 pass, 1 FAIL recorded, 2 could not run) and its run id, None when it is not recorded. Nothing is retried."""
+    with the scene's save and slot and env, played, and its window held. No screenshot is taken (DL185): the run is recorded
+    with hx run's files and no screenshots, and its log is what the gate reads. Returns its status (0 pass, 1 FAIL
+    recorded, 2 could not run) and its run id, None when it is not recorded. Nothing is retried."""
     job = os.path.abspath(sub_job)
     game_dir = os.path.join(job, "game")
     try:
@@ -253,10 +250,9 @@ def correctness_run(sub_job, root, build_folder, device, expect, env, scene_name
         print("hx floor: the game did not start: %s" % e, file=sys.stderr)
         return 2, None
     print("device: %s" % device)
-    why, first, last, here, shots = None, None, None, None, {}
+    why, first, last, here = None, None, None, None
     try:
         first, last, here = play(running, scene, expect)
-        shots = take_shots(running, job)
     except (*hx_run.FAILURES, OSError) as e:
         why = str(e)
     exit_status = None
@@ -286,7 +282,7 @@ def correctness_run(sub_job, root, build_folder, device, expect, env, scene_name
         facts = runrecord.facts(build_txt, hx_run.read_diff(build_folder), hashes, game.run_env(job, env), expect,
                                 machine(), os.path.expanduser("~"), getpass.getuser())
         facts["suite_sha256"] = suite.sha256
-        run_id, _ = record.write_run(runrecord.results_dir(root), facts, files, shots, journal)
+        run_id, _ = record.write_run(runrecord.results_dir(root), facts, files, {}, journal)
     except (OSError, runrecord.RunRecordError, record.RecordError) as e:
         print("hx floor: the run is not recorded: %s" % e, file=sys.stderr)
         return 2, None
@@ -299,26 +295,6 @@ def correctness_in_job(a):
     """hx floor --correctness-in-job: one correctness run, as its own process. Returns the run's status."""
     status, _ = correctness_run(a.job, a.root, a.build_folder, a.device, a.expect, dict(a.env or []), a.scene)
     return status
-
-
-def take_shots(running, job):
-    """SHOTS screenshots of the held window, each after SHOT_PRESENTS presents, through the game's bridge and written under
-    the job's run/ folder: {name: PNG bytes}, read back from there."""
-    run_dir = os.path.join(job, "run")
-    conn = running.connect()
-    try:
-        session = bridge.Session(conn)
-        shots = {}
-        for number in range(1, SHOTS + 1):
-            name = "shot_%d.png" % number
-            path = os.path.join(run_dir, name)
-            session.call("wait", event="present", frames=SHOT_PRESENTS, timeout=hx_run.WAIT_SECONDS)
-            session.call("shot", path=path, timeout=hx_run.WAIT_SECONDS)
-            with open(path, "rb") as f:
-                shots[name] = f.read()
-        return shots
-    finally:
-        conn.close()
 
 
 def run_series(a, method, wait, launch=launch):
@@ -456,18 +432,6 @@ def run_log(results, run_id):
     return _run_file(results, run_id, manifest, hx_run.RUN_FILES["log"]).decode("utf-8", "replace")
 
 
-def run_shots(results, run_id):
-    """A run's screenshots by name, each as its file in the record's screenshots folder, checked against its manifest entry"""
-    manifest = _manifest(results, run_id)
-    shots = {}
-    for name, entry in manifest["screenshots"].items():
-        digest = entry.get("sha256") if isinstance(entry, dict) else None
-        path = Path(results) / "screenshots" / str(digest)
-        _checked(path, entry, "run %s, screenshot %s" % (run_id, name))
-        shots[name] = path
-    return shots
-
-
 def read_floor(results, run_id):
     """A recorded run's floor.json, read back and checked against its manifest, as its payload. FloorError when the run does
     not name it, the file is changed, or it is not a JSON object."""
@@ -493,24 +457,20 @@ def arm_runs(entries):
     return timed, correct
 
 
-def measure(results, entries, method, flip):
+def measure(results, entries, method):
     """The floor's measured values from a series whose every run passed: the noise floor and its interval over the two arms'
-    timed runs, each run's median warm frame time, and the image tolerance and determinism of the two correctness runs. A
-    void baseline (a flash, a hang, a validation error only in B, or shots beyond the tolerance) is a FloorError naming it.
-    A refused value raises FloorError, VerdictError or gate.GateError."""
+    timed runs, and each run's median warm frame time. A void baseline (a flash in either correctness log, a validation
+    error only in B, or a hang in any log) is a FloorError naming it. A refused value raises FloorError or VerdictError."""
     timed, correct = arm_runs(entries)
     a_runs = [run_frames(results, run) for run in timed["A"]]
     b_runs = [run_frames(results, run) for run in timed["B"]]
     low, high = verdict.bootstrap(a_runs, b_runs, method)
-    a_shots, b_shots = run_shots(results, correct["A"]), run_shots(results, correct["B"])
-    image = gate.tolerance(a_shots, b_shots, flip)
-    reasons = gate.void_reasons(image, a_shots, b_shots, run_log(results, correct["A"]),
-                                run_log(results, correct["B"]),
-                                [run_log(results, run) for run in timed["A"] + timed["B"]], flip)
+    reasons = gate.void_reasons(run_log(results, correct["A"]), run_log(results, correct["B"]),
+                                [run_log(results, run) for run in timed["A"] + timed["B"]])
     if reasons:
         raise FloorError("the baseline is void: " + "; ".join(reasons))
     return {"floor": verdict.noise_floor(a_runs, b_runs, method), "interval": [low, high],
-            "a_medians": _medians(a_runs, method), "b_medians": _medians(b_runs, method), "image": image}
+            "a_medians": _medians(a_runs, method), "b_medians": _medians(b_runs, method)}
 
 
 def _medians(runs, method):
@@ -549,8 +509,8 @@ def in_job(a):
     entries, reason, measured = series["entries"], series["failure"], None
     if reason is None:
         try:
-            measured = measure(runrecord.results_dir(a.root), entries, method, shutil.which("flip"))
-        except (FloorError, verdict.VerdictError, gate.GateError) as e:
+            measured = measure(runrecord.results_dir(a.root), entries, method)
+        except (FloorError, verdict.VerdictError) as e:
             reason = str(e)
     payload = {
         "kind": "floor", "outcome": "failed" if reason else "recorded", "reason": reason,
@@ -568,9 +528,7 @@ def in_job(a):
     if reason is not None:
         print("floor: FAIL %s" % reason)
         return 1
-    image = measured["image"]
     print("noise floor %.2f%% (interval %.2f%% to %.2f%%)"
           % (measured["floor"] * 100, measured["interval"][0] * 100, measured["interval"][1] * 100))
-    print("image tolerance %.6f (%s), %s" % (image["tolerance"], image["metric"], image["determinism"]))
     print("floor: recorded")
     return 0

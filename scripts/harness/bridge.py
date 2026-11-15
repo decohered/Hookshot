@@ -1,11 +1,11 @@
 """The harness's session with a running game over one control connection (the bridge, docs/control.md). A session enters
-play from a save, switches age, arrives somewhere by teleport and confirms it by the map the game reports, with no load
-or event pending, checks that the renderer is the expected device, and holds a window that fails on a map change or a
-load. A request the game refuses, or a state that does not come, raises BridgeError naming it. The one request sent
-again is a teleport the game refuses because an event is playing or because its event manager declined it:
-Session.arrive settles and sends it again until its deadline. The game's state is acted on only from a status whose
-game.frame, the present count its flags were read at, is an integer at or after the frame the check needs (_fresh): a
-status that is not is read again.
+play from a save, switches age, arrives somewhere by teleport, waits for the teleport's arrival event to begin and to end,
+and confirms it by the map the game reports with no load or event pending, checks that the renderer is the expected
+device, and holds a window that fails on a map change or a load. A request the game refuses, or a state that does not
+come, raises BridgeError naming it. The one request sent again is a teleport the game refuses because an event is
+playing or because its event manager declined it: Session.arrive settles and sends it again until its deadline. The
+game's state is acted on only from a status whose game.frame, the present count its flags were read at, is an integer
+at or after the frame the check needs (_fresh): a status that is not is read again.
 
 The connection is any object with request(cmd, timeout=None, **args) that returns the reply as a dict, as
 hookshot_ctl.Bridge does. The clock and the sleep are injected, so the tests run without waiting. Stdlib only.
@@ -16,7 +16,7 @@ SWITCH_GAP = 8        # seconds the game refuses a teleport or an age switch aft
 ENTER_FRAMES = 60     # presents waited after each press when entering play
 PRESENT_HZ = 60       # the game's paced present rate (host/nn_vi.c)
 PRESS_SECONDS = ENTER_FRAMES / PRESENT_HZ   # the wall-clock time ENTER_FRAMES presents take at that rate: a press's least
-WINDOW_STEP = 60      # presents per step of a window
+WINDOW_STEP = 60      # game frames per step of a window
 SETTLE_SECONDS = 60   # how long arrive waits for play with no event or load; the deadline for resending its teleport
 POLL_SECONDS = 0.25   # between the status reads of a settle, and before resending a teleport refused for an event
 ENTER_SECONDS = 1800  # enter_play's limit for menu or play: a fresh build takes minutes to prepare its shaders
@@ -53,6 +53,11 @@ def _fresh(status, needed):
     return type(frame) is int and frame >= needed
 
 
+def _begun(status, expected, needed):
+    """True when the status is read at or after `needed` on the reported map with the arrival event playing"""
+    return _fresh(status, needed) and status.get("map") == expected and (status.get("game") or {}).get("event") is True
+
+
 def _at_menu_or_play(status):
     return status.get("state") in ("menu", "play")
 
@@ -75,6 +80,10 @@ def _check_steady(status, expect_map, allow_event):
     else:
         return
     raise BridgeError("the window is not steady at game.frame %s: %s" % (_game_frame(status), bad))
+
+
+def _wrong_map(to, expected, status):
+    return BridgeError("teleport to %r arrived on %r, not the reported %r" % (to, status.get("map"), expected))
 
 
 class Session:
@@ -125,13 +134,13 @@ class Session:
             return status
         raise BridgeError("not in play after %d presses: %s" % (presses, _describe(status)))
 
-    def settle(self, timeout_s, frame=None):
-        """Reads the status until the game is in play with no event or load, read at or after `frame` (the first
-        status's own frame when none is passed), and returns it. Raises BridgeError, naming the state and the frame
-        needed, when that has not come within timeout_s by the clock."""
+    def settle(self, timeout_s):
+        """Reads the status until the game is in play with no event or load, read at or after the frame of its first
+        status, and returns it. Raises BridgeError, naming the state and the frame needed, when that has not come
+        within timeout_s by the clock."""
         deadline = self.clock() + timeout_s
         status = self.status()
-        needed = status["frame"] if frame is None else frame
+        needed = status["frame"]
         while not (_settled(status) and _fresh(status, needed)):
             if self.clock() >= deadline:
                 raise BridgeError("not in play with no event or load at frame %s after %s s: %s, game.frame %s"
@@ -142,15 +151,16 @@ class Session:
 
     def _fresh_status(self, status, needed=None):
         """Returns `status` once it is read at or after `needed` (its own frame when none is given). While it is not,
-        the status is read again every POLL_SECONDS, for up to SETTLE_SECONDS by the clock. Raises BridgeError, naming
-        the frame needed and the last game.frame, when that does not come."""
+        the game is presented one frame and the status read again, for up to SETTLE_SECONDS by the clock. It never
+        sleeps, so the frames it waits for pass in the game. Raises BridgeError, naming the frame needed and the last
+        game.frame, when that does not come."""
         needed = status["frame"] if needed is None else needed
         deadline = self.clock() + SETTLE_SECONDS
         while not _fresh(status, needed):
             if self.clock() >= deadline:
                 raise BridgeError("the window's status is not at frame %s after %s s: last game.frame %s"
                                   % (needed, SETTLE_SECONDS, _game_frame(status)))
-            self.sleep(POLL_SECONDS)
+            self.call("wait", event="present", frames=1)
             status = self.status()
         return status
 
@@ -200,15 +210,54 @@ class Session:
             self.last_switch = self.clock()
         return reply
 
+    def _arrival_begins(self, to, expected, needed):
+        """Returns the status at which the teleport's arrival event begins: the status is read once, then after each
+        one-frame present while it has not begun, for up to SETTLE_SECONDS by the clock. A status read at or after
+        `needed` on another map raises the wrong-map error at once, and one read before `needed` is not counted. Raises
+        BridgeError, naming the arrival event, the map and the last status, when the event does not begin in time."""
+        deadline = self.clock() + SETTLE_SECONDS
+        status = self.status()
+        while not _begun(status, expected, needed):
+            if _fresh(status, needed) and status.get("map") != expected:
+                raise _wrong_map(to, expected, status)
+            if self.clock() >= deadline:
+                raise BridgeError("the arrival event of the teleport to %r did not begin on %r at frame %s or later "
+                                  "within %s s: last status %s, map %r, game.frame %s"
+                                  % (to, expected, needed, SETTLE_SECONDS, _describe(status), status.get("map"),
+                                     _game_frame(status)))
+            self.call("wait", event="present", frames=1)
+            status = self.status()
+        return status
+
+    def _arrival_ends(self, needed):
+        """Returns the status at which the teleport's arrival event has ended: the status is read once, then after each
+        one-frame present while it is not in play with no event or load at a frame `needed` or later, for up to
+        SETTLE_SECONDS by the clock, as _arrival_begins reads the event's begin. Raises BridgeError, naming the frame
+        needed and the last status, when that does not come in time."""
+        deadline = self.clock() + SETTLE_SECONDS
+        status = self.status()
+        while not (_settled(status) and _fresh(status, needed)):
+            if self.clock() >= deadline:
+                raise BridgeError("not in play with no event or load at frame %s after %s s: %s, game.frame %s"
+                                  % (needed, SETTLE_SECONDS, _describe(status), _game_frame(status)))
+            self.call("wait", event="present", frames=1)
+            status = self.status()
+        return status
+
     def arrive(self, to, age=None):
         """Switches to `age` if one is given, then, once the switch gap has passed, waits until the game is in play with
-        no event or load, teleports to `to`, and waits until a status read after the teleport's frame shows the game in
-        play with no event or load. Returns the map the game reported for the teleport, once the game is on it. The
-        teleport is the one request repeated: when the game refuses it because an event is playing, or because its event
-        manager declined it, it is sent again after a settle, until SETTLE_SECONDS have passed since the first settle
-        began (see _teleport). Raises BridgeError when the game does not settle before the teleport, when it refuses the
-        teleport for another reason or fails it, when the map does not come, or when the game is on another map. The gap
-        for the next switch counts from when this returns or raises."""
+        no event or load, teleports to `to`, and waits for the teleport's arrival event. Once the game reports the map,
+        the event must begin: a status read at or after the teleport's frame + 1 on that map with the event playing,
+        read after each one-frame present, within SETTLE_SECONDS. Then the event must end: a status read at or after the
+        begin's frame + 1 in play with no event or load, read after each one-frame present as the begin is
+        (_arrival_ends), within SETTLE_SECONDS. So the return comes at the status of the event's end frame, not at a
+        POLL_SECONDS poll. Returns the map the game reported for the teleport, once the game is on it and the event has
+        ended. The teleport is the one request repeated: when the game refuses it because an event is playing, or
+        because its event manager declined it, it is sent again after a settle, until SETTLE_SECONDS have passed since
+        the first settle began (see _teleport). Raises BridgeError when the game does not settle before the teleport,
+        when it refuses the teleport for another reason or fails it, when the map does not come, when the arrival
+        event does not begin or does not end, or when the game is on another map. The gap for the next switch counts
+        from when this returns or raises."""
         if age is not None:
             self.age(age)
         self._wait_gap()
@@ -220,27 +269,29 @@ class Session:
             self.call("wait", event="map", map=expected)
             # strictly after the teleport's frame: the teleport takes one present after its reply, so the first whole
             # frame it can show is the reply's frame + 1
-            status = self.settle(SETTLE_SECONDS, frame=reply["frame"] + 1)
+            begun = self._arrival_begins(to, expected, reply["frame"] + 1)
+            status = self._arrival_ends(begun["game"]["frame"] + 1)
             if status.get("map") != expected:
-                raise BridgeError("teleport to %r arrived on %r, not the reported %r"
-                                  % (to, status.get("map"), expected))
+                raise _wrong_map(to, expected, status)
             return expected
         finally:
             self.last_switch = self.clock()
 
     def window(self, frames, expect_map, allow_event=False):
-        """Holds the game for `frames` presents, in steps of WINDOW_STEP, and reads the status before the first step and
-        after each: the map must stay expect_map with no load, and with no event unless allow_event. The first status is
-        read at or after its own frame, and each later one at or after the frame of the wait before it (_fresh_status).
-        Returns the first status and the last. Raises BridgeError naming what changed."""
+        """Holds the game for `frames` game frames, in steps of WINDOW_STEP, and reads the status before the first step
+        and after each: the map must stay expect_map with no load, and with no event unless allow_event. Each step waits
+        for the game frame that the first status's game.frame plus the frames held so far gives, so the window ends at
+        first + frames whatever the frame rate, and a wait that overshoots does not move the next step. Each status
+        after a step is read at or after the step's frame (_fresh_status). Returns the first status and the last. Raises
+        BridgeError naming what changed."""
         first = self._fresh_status(self.status())
         _check_steady(first, expect_map, allow_event)
+        start = first["game"]["frame"]
         last = first
         held = 0
         while held < frames:
-            step = min(WINDOW_STEP, frames - held)
-            waited = self.call("wait", event="present", frames=step)
-            held += step
-            last = self._fresh_status(self.status(), waited["frame"])
+            held += min(WINDOW_STEP, frames - held)
+            self.call("wait", event="frame", frame=start + held)
+            last = self._fresh_status(self.status(), start + held)
             _check_steady(last, expect_map, allow_event)
         return first, last

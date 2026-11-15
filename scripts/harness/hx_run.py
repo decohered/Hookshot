@@ -5,7 +5,7 @@ a warm copy of its game for this device, which a passing cold run makes.
 The client half (on this PC) checks the device, reads the build's build.txt on the host and starts a bench
 job. The in-job half (on the host) waits for the hold, selects the scene from the suite file, copies the build's game (its
 warm copy for a warm scene) into the job, starts the game with the scene's save and slot, enters play, checks the device,
-sets the hour, plays the scene's route and holds its window (seconds of presents) through the control bridge
+plays the scene's route, sets the hour and holds its window (seconds of presents) through the control bridge
 (docs/control.md). It quits the game and writes one record: the raw outputs, the metrics, the scene's file and the suite
 file.
 
@@ -197,31 +197,40 @@ def load_scene(root, name, final):
 
 
 def play(running, scene, expect):
-    """Plays the scene on the game: in play and on the device, the hour set, the route played, then the window held. Returns
-    the window's first status, its last, and the map it was held on. The bridge's and the game's errors are raised."""
+    """Plays the scene on the game: in play and on the device, the route played, then the window held. The game's day
+    advances per present, so the hour is set once the route's wall-timed steps are done: a scene with an hour sets it
+    after its route and before its window, and a load scene sets it after its arrival, before its window. Returns the
+    window's first status, its last, and the map it was held on. The bridge's and the game's errors are raised."""
     conn = running.connect()
     try:
         session = bridge.Session(conn)
         session.enter_play(PRESSES_TO_PLAY)
         session.check_device(expect)
-        if scene.hour is not None:
-            running.set_hour(scene.hour)
-            session.call("wait", event="present", frames=HOUR_FRAMES, timeout=WAIT_SECONDS)
         for step in scene.route:
             route_step(session, step)
-        if scene.motion == "moving":
-            session.call("sequence", script=scene.inputs, wait=False)
         frames = scene.seconds * FPS
         if scene.kind == "load":
             first = session.status()
             here = session.arrive(scene.load_to)
+            start_window(running, session, scene)
             _, last = session.window(frames, here)
         else:
+            start_window(running, session, scene)
             here = session.status().get("map")
             first, last = session.window(frames, here, allow_event=scene.kind == "cutscene")
         return first, last, here
     finally:
         conn.close()
+
+
+def start_window(running, session, scene):
+    """What the window's stretch starts with: the scene's hour, set and waited for its presents when it has one, then a
+    moving scene's input sequence, started without a wait so that it runs through the window"""
+    if scene.hour is not None:
+        running.set_hour(scene.hour)
+        session.call("wait", event="present", frames=HOUR_FRAMES, timeout=WAIT_SECONDS)
+    if scene.motion == "moving":
+        session.call("sequence", script=scene.inputs, wait=False)
 
 
 def route_step(session, step):

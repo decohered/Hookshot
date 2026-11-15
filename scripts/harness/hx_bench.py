@@ -1,8 +1,8 @@
 """hx bench: the A-B-B-A series of two builds of this checkout as one bench job, on one device and scene, judged against a
 recorded floor of that device, scene and method (hx floor's record). The series is hx floor's (hx_floor.run_series): each run
 once, through its arm's closure, waiting for the hold before each. The bench is void when the gate voids it (gate.void_reasons
-over the floor's image tolerance, both correctness runs and every timed log), failed when the series ended early or a run
-cannot be read back, and else the verdict's call against the floor's noise floor (verdict.verdict). One record run
+over both correctness runs' logs and every timed log; no picture is compared, DL185), failed when the series ended early or a
+run cannot be read back, and else the verdict's call against the floor's noise floor (verdict.verdict). One record run
 (bench.json) is written with the verdict, or the reasons it has none.
 
     hx bench A B --device D --scene S --floor ID
@@ -15,7 +15,6 @@ written). The client returns the job's status; 255 is ssh lost, and the job goes
 """
 import argparse
 import dataclasses
-import shutil
 import sys
 
 import config
@@ -76,7 +75,7 @@ def main(argv):
 
 def check_floor(results, a, method):
     """The recorded floor the bench is judged against: a floor of this device, scene and method, recorded, with its noise
-    floor and image tolerance. FloorError otherwise, before any run."""
+    floor. FloorError otherwise, before any run."""
     floor = hx_floor.read_floor(results, a.floor)
     if floor.get("kind") != "floor":
         raise hx_floor.FloorError("run %s is not a floor" % a.floor)
@@ -85,34 +84,27 @@ def check_floor(results, a, method):
     for key, want in (("device", a.device), ("scene", a.scene), ("method", dataclasses.asdict(method))):
         if floor.get(key) != want:
             raise hx_floor.FloorError("floor %s is for %s %r, not %r" % (a.floor, key, floor.get(key), want))
-    image = floor.get("image")
-    if not (isinstance(floor.get("floor"), (int, float)) and isinstance(image, dict)
-            and "metric" in image and "tolerance" in image):
-        raise hx_floor.FloorError("floor %s has no noise floor, or no image with a metric and tolerance" % a.floor)
+    if not isinstance(floor.get("floor"), (int, float)):
+        raise hx_floor.FloorError("floor %s has no noise floor" % a.floor)
     return floor
 
 
-def judge(results, series, floor, method, flip):
+def judge(results, series, floor, method):
     """The bench's outcome as (outcome, reason, void_reasons, measured). failed, with its reason, when the series did not run
-    through or a run cannot be read back; void, with the gate's reasons, when the gate voids it; else the verdict's call
-    with its interval and medians as measured. A GateError is one void reason: its own message."""
+    through or a run cannot be read back; void, with the gate's reasons, when the gate voids it (the logs only: no picture
+    is compared, DL185); else the verdict's call with its interval and medians as measured."""
     if series["failure"] is not None:
         return "failed", series["failure"], [], None
     try:
         timed, correct = hx_floor.arm_runs(series["entries"])
         a_runs = [hx_floor.run_frames(results, run) for run in timed["A"]]
         b_runs = [hx_floor.run_frames(results, run) for run in timed["B"]]
-        a_shots = hx_floor.run_shots(results, correct["A"])
-        b_shots = hx_floor.run_shots(results, correct["B"])
         a_log = hx_floor.run_log(results, correct["A"])
         b_log = hx_floor.run_log(results, correct["B"])
         timed_logs = [hx_floor.run_log(results, run) for run in timed["A"] + timed["B"]]
     except hx_floor.FloorError as e:
         return "failed", str(e), [], None
-    try:
-        reasons = gate.void_reasons(floor["image"], a_shots, b_shots, a_log, b_log, timed_logs, flip)
-    except gate.GateError as e:
-        reasons = [str(e)]
+    reasons = gate.void_reasons(a_log, b_log, timed_logs)
     if reasons:
         return "void", None, reasons, None
     try:
@@ -136,13 +128,13 @@ def in_job(a):
         print("hx bench: could not run: %s" % e, file=sys.stderr)
         return 2
     series = hx_floor.run_series(a, method, lambda: jobs.wait_hold(a.hold))
-    outcome, reason, void_reasons, measured = judge(results, series, floor, method, shutil.which("flip"))
+    outcome, reason, void_reasons, measured = judge(results, series, floor, method)
     entries = series["entries"]
     payload = {
         "kind": "bench", "outcome": outcome, "reason": reason, "void_reasons": void_reasons,
         "device": a.device, "expect": a.expect, "scene": a.scene, "a_sha": a_sha, "b_sha": b_sha,
         "suite_sha256": suite.sha256, "method": dataclasses.asdict(method), "floor_run": a.floor,
-        "floor": floor["floor"], "image": floor["image"], "validation": series["validation"], "series": entries,
+        "floor": floor["floor"], "validation": series["validation"], "series": entries,
         **(measured or {key: None for key in BENCH_MEASURED}),
     }
     first = next((e["run"] for e in entries if e["run"] is not None), None)

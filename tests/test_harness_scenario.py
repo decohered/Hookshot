@@ -8,9 +8,10 @@ is read.
 `hx run` (scripts/harness/hx_run.py): the in-job half runs one suite scene against a temporary harness root and a stand-in
 game that answers the control bridge over its socket (docs/control.md): the suite file is in the record with its sha256
 (R3); a held-out scene runs only with --final, an unknown or warm-without-copy scene exits 2 before any launch, and nothing
-is written then (R6); the route runs in order and the window holds the scene's frames, the raw outputs and metrics are kept
-(R4, R5); each run is one record that hx verify passes, and a wrong device or a fallback is a recorded FAIL (R7). The client
-half runs through hx.py with fake ssh, systemd-run and systemctl, so the scene runs through its bench job.
+is written then (R6); the route runs in order, the hour is set after it and before the window, and the window holds the
+scene's frames, the raw outputs and metrics are kept (R4, R5); each run is one record that hx verify passes, and a wrong
+device or a fallback is a recorded FAIL (R7). The client half runs through hx.py with fake ssh, systemd-run and
+systemctl, so the scene runs through its bench job.
 
 python -I -B tests/test_harness_scenario.py
 """
@@ -36,6 +37,7 @@ HARNESS = ROOT / "scripts" / "harness"
 HX = HARNESS / "hx.py"
 sys.path.insert(0, str(HARNESS))
 import bridge
+import game
 import hx_run
 import hx_verify
 import metrics
@@ -68,7 +70,7 @@ def render(suite):
     return text.encode("utf-8")
 
 
-def complete():
+def complete() -> dict[str, dict[str, object]]:
     """A suite with every kind, both caches, both motions, and held-out and other scenes"""
     return {
         "scene_a": {"kind": "light", "cache": "warm", "motion": "still", "save": "save_a", "seconds": 120,
@@ -368,7 +370,8 @@ VULKANINFO = "\n".join([
 ])
 
 # The stand-in game. It logs each request and its launch (the save folder it has, its build's marker, its device variable),
-# prints the renderer's metric lines and FAKE_FALLBACK's fallback line, answers the bridge's requests over HOS_CONTROL, and
+# prints the renderer's metric lines and FAKE_FALLBACK's fallback line, answers the bridge's requests over HOS_CONTROL (a
+# teleport starts an arrival event, as the game's does: the next status shows it playing, and it ends one present later), and
 # on quit writes the frame trace for every frame presented. FAKE_RENDERER is the renderer status reports, FAKE_REFUSE a
 # request it refuses. @HARNESS@ and @SCRIPTS@ are the folders of the harness and of hookshot_ctl.
 STAND_IN = r'''
@@ -387,6 +390,7 @@ env = os.environ
 log = open(env["FAKE_GAME_LOG"], "a", buffering=1)
 ticks = [0]
 here = ["start_map"]
+arriving = [False]   # (a teleport's arrival event, playing until a status has shown it)
 saves = os.path.join(env["XDG_DATA_HOME"], "hookshot", "save", hookshot_ctl.SAVE_USER)
 marker = open("marker").read() if os.path.exists("marker") else None
 log.write(json.dumps({"cmd": "_start", "marker": marker,
@@ -420,11 +424,17 @@ def answer(req):
     if cmd == env.get("FAKE_REFUSE"):
         return {"ok": False, "error": "refused", "message": "%s refused by the stand-in" % cmd}
     if cmd == "status":
-        return {"ok": True, "frame": ticks[0], "replayed": ticks[0], "draws": 2410.3,
-                "renderer": env["FAKE_RENDERER"], "state": "play", "map": here[0],
-                "game": {"event": False, "loading": False, "age": "child", "frame": ticks[0]}}
+        event = arriving[0]
+        reply = {"ok": True, "frame": ticks[0], "replayed": ticks[0], "draws": 2410.3,
+                 "renderer": env["FAKE_RENDERER"], "state": "play", "map": here[0],
+                 "game": {"event": event, "loading": False, "age": "child", "frame": ticks[0]}}
+        if event:   # the arrival event a teleport starts: read once, and it ends one present later
+            arriving[0] = False
+            ticks[0] += 1
+        return reply
     if cmd == "teleport":
         here[0] = "dest_%s" % req["to"]
+        arriving[0] = True
         frame = ticks[0]
         ticks[0] += 1   # the teleport takes one present, after its reply
         return {"ok": True, "frame": frame, "teleport": 1, "sent": True, "map": here[0]}
@@ -435,6 +445,8 @@ def answer(req):
     if cmd == "wait":
         if req.get("event") == "present":
             ticks[0] += req.get("frames", 1)
+        if req.get("event") == "frame":
+            ticks[0] = max(ticks[0], req["frame"])
         return {"ok": True, "frame": ticks[0], "state": "play", "waited": 0, "map": here[0]}
     return {"ok": False, "error": "unknown_cmd", "message": str(cmd)}
 
@@ -550,6 +562,11 @@ def write_file(path, text):
 def make_executable(path, text):
     path.write_text(text, encoding="utf-8")
     path.chmod(0o755)
+
+
+def window_waits(order):
+    """The indexes of the window's frame waits in a trace_order list"""
+    return [i for i, (cmd, args) in enumerate(order) if cmd == "wait" and args.get("event") == "frame"]
 
 
 class RunFixture(unittest.TestCase):
@@ -708,7 +725,10 @@ class RunInJobTest(RunFixture):
             ("sequence", None, None, "walk_a", True),
             ("sequence", None, None, "walk_a", False),
         ])
-        self.assertEqual([(r["event"], r["frames"]) for r in moves[6:]], [("present", 60)] * 120)
+        targets = [r["frame"] for r in moves[6:] if r["event"] == "frame"]
+        self.assertEqual(len(targets), 120)
+        self.assertEqual([r["event"] for r in moves[6:]], ["frame"] * 120)
+        self.assertEqual([later - earlier for earlier, later in zip(targets, targets[1:])], [60] * 119)
 
     def test_r4_a_warm_scene_starts_from_the_warm_copy_with_its_save_slot_and_hour(self):
         self.make_game(self.build_folder / "warm" / DEVICE / "game", "warm")
@@ -719,6 +739,83 @@ class RunInJobTest(RunFixture):
         self.assertEqual(started["saves"], ["account.sav", "option.sav", "slot_01"])
         self.assertEqual(started["env"]["HOS_EXAMPLE"], "1")
         self.assertEqual((self.job_path() / "run" / "live.txt").read_text(encoding="utf-8"), "!cheat 123\n")
+
+    # the hour: set after the route's wall-timed steps and before the window, since the game's day advances per present
+
+    def trace_order(self):
+        """Records, in the order the run makes them, each bridge request as (cmd, args) and each hour write as ("hour",
+        {"hour": H}). Returns the list the run fills."""
+        order = []
+        request, set_hour = game.ctl.Bridge.request, game.Game.set_hour
+
+        def traced_request(conn, cmd, **args):
+            order.append((cmd, args))
+            return request(conn, cmd, **args)
+
+        def traced_set_hour(running, hour):
+            order.append(("hour", {"hour": hour}))
+            return set_hour(running, hour)
+
+        for target, name, traced in ((game.ctl.Bridge, "request", traced_request),
+                                     (game.Game, "set_hour", traced_set_hour)):
+            patch = mock.patch.object(target, name, traced)
+            patch.start()
+            self.addCleanup(patch.stop)
+        return order
+
+    def test_a_scene_with_an_hour_sets_it_after_its_route_and_before_its_window(self):
+        self.make_game(self.build_folder / "warm" / DEVICE / "game", "warm")
+        order = self.trace_order()
+        code, out, err = self.run_in_job("scene_c", final=True)
+        self.assertEqual(code, 0, out + err)
+        hour = order.index(("hour", {"hour": 23}))
+        for route in (("teleport", {"to": 2}), ("age", {"to": "adult"}), ("sequence", {"script": "walk_b"})):
+            self.assertLess(order.index(route), hour, route)
+        self.assertEqual(order[hour + 1], ("wait", {"event": "present", "frames": hx_run.HOUR_FRAMES,
+                                                    "timeout": hx_run.WAIT_SECONDS}))
+        motion = order.index(("sequence", {"script": "walk_b", "wait": False}))
+        self.assertGreater(motion, hour + 1)
+        self.assertGreater(window_waits(order)[0], motion)
+
+    def test_a_load_scene_with_an_hour_sets_it_after_its_arrival_and_before_its_window(self):
+        suite = complete()
+        suite["scene_d"]["hour"] = 5
+        (self.root / "scenes" / SUITE_FILE).write_bytes(render(suite))
+        order = self.trace_order()
+        code, out, err = self.run_in_job("scene_d", final=True)
+        self.assertEqual(code, 0, out + err)
+        hour = order.index(("hour", {"hour": 5}))
+        self.assertLess(order.index(("teleport", {"to": 3})), hour)
+        self.assertEqual(order[hour - 1], ("status", {}), "the arrival ends on a status read")
+        self.assertEqual(order[hour + 1], ("wait", {"event": "present", "frames": hx_run.HOUR_FRAMES,
+                                                    "timeout": hx_run.WAIT_SECONDS}))
+        self.assertGreater(window_waits(order)[0], hour + 1)
+
+    def test_a_moving_load_scene_starts_its_input_sequence_after_its_arrival_and_its_hour(self):
+        suite = complete()
+        suite["scene_d"].update({"motion": "moving", "inputs": "walk_a", "hour": 5})
+        (self.root / "scenes" / SUITE_FILE).write_bytes(render(suite))
+        order = self.trace_order()
+        code, out, err = self.run_in_job("scene_d", final=True)
+        self.assertEqual(code, 0, out + err)
+        hour = order.index(("hour", {"hour": 5}))
+        self.assertLess(order.index(("teleport", {"to": 3})), hour)
+        motion = order.index(("sequence", {"script": "walk_a", "wait": False}))
+        self.assertGreater(motion, hour + 1)
+        self.assertGreater(window_waits(order)[0], motion)
+
+    def test_a_moving_load_scene_without_an_hour_starts_its_input_sequence_after_its_arrival(self):
+        suite = complete()
+        suite["scene_d"].update({"motion": "moving", "inputs": "walk_a"})
+        suite["scene_d"].pop("hour", None)
+        (self.root / "scenes" / SUITE_FILE).write_bytes(render(suite))
+        order = self.trace_order()
+        code, out, err = self.run_in_job("scene_d", final=True)
+        self.assertEqual(code, 0, out + err)
+        self.assertNotIn("hour", [cmd for cmd, _ in order])
+        motion = order.index(("sequence", {"script": "walk_a", "wait": False}))
+        self.assertLess(order.index(("teleport", {"to": 3})), motion)
+        self.assertGreater(window_waits(order)[0], motion)
 
     # R5: the run keeps its raw outputs and its metrics: the frame times, every trace column, replay, GPU time, RSS,
     # VRAM and the exit status
@@ -732,18 +829,19 @@ class RunInJobTest(RunFixture):
         self.assertIn(b"stand-in: started", self.record_file("log.txt"))
         trace = self.record_file("hookshot_frames.csv").decode("utf-8").splitlines()
         self.assertEqual(trace[0], ",".join(metrics.TRACE_COLUMNS))
-        self.assertEqual(len(trace), 1 + 7201)
+        # every frame presented: the teleport's, its arrival event's, then the window's 7200 presents
+        self.assertEqual(len(trace), 1 + 7202)
         report = json.loads(self.record_file("metrics.json"))
-        self.assertEqual(report["trace"]["rows"], 7201)
+        self.assertEqual(report["trace"]["rows"], 7202)
         self.assertEqual(sorted(report["trace"]["columns"]), sorted(metrics.TRACE_COLUMNS[1:]))
-        self.assertEqual(report["frame_time_ms"]["n"], 7201)
+        self.assertEqual(report["frame_time_ms"]["n"], 7202)
         self.assertEqual(report["replay_ms"]["submit"]["mean"], 1.0)
         self.assertEqual(report["gpu_ms"]["max"], 12.5)
         self.assertEqual(report["longest_submission_ms"]["max"], 3.25)
         self.assertEqual(report["rss_mb"]["peak_mb"]["max"], 600)
         self.assertEqual(report["vram_mb"]["used_mb"]["max"], 1024)
         self.assertEqual(report["hangs"]["exit_status"], 0)
-        self.assertEqual((report["window"]["first"], report["window"]["last"]), (1, 7201))
+        self.assertEqual((report["window"]["first"], report["window"]["last"]), (2, 7202))
         self.assertEqual(report["window"]["trace"]["rows"], 7201)
         self.assertEqual(report["window"]["frame_time_ms"]["n"], 7201)
 

@@ -77,7 +77,8 @@ CRAWL = 'save = "start"\nslot = "01"\npan_frames = 45\nsettle_frames = 5\n'
 TOOLS = ("systemd-run", "systemctl", "btrfs", "sha256sum", "vulkaninfo", "nvidia-smi", "systemd-cat", "journalctl")
 
 # The stand-in game: a Python script named hookshot's stand-in. It answers the bridge's requests as docs/control.md gives them
-# for the ones the crawl makes, logs each request and its own start (its folder's files and the save files under its data
+# for the ones the crawl makes (a teleport starts an arrival event, as the game's does: the next status shows it playing,
+# and it ends one present later), logs each request and its own start (its folder's files and the save files under its data
 # folder) to FAKE_GAME_LOG, and at quit writes a frame trace beside itself and a frame log. Its destinations and their maps
 # by age are fixed here. FAKE_AFTER_STICK (event, loading or map) is what its status reports from a stick until the next
 # teleport: an event playing, a load going on, or the game on another map. Its n-th start prints "stand-in start n" and
@@ -108,7 +109,7 @@ DESTINATIONS = [
 ]
 lock = threading.Lock()
 state = {"frame": 0, "age": "child", "map": "Start_area", "after_stick": "", "event_reads": 0, "start_event": False,
-         "reads_after_stick": None}
+         "reads_after_stick": None, "arriving": False}
 
 
 def note(obj):
@@ -139,15 +140,23 @@ def reply(req):
             if state["event_reads"] > int(env["FAKE_EVENT_READS"]):
                 state["after_stick"] = ""
         after = state["after_stick"]
+        arrival = state["arriving"]
+        if arrival:   # the arrival event a teleport starts: read once, and it ends one present later
+            state["arriving"] = False
+            state["frame"] += 1
         return {"ok": True, "frame": frame, "replayed": frame, "draws": 2410.5, "state": "play",
                 "map": "Other_area" if after == "map" else state["map"],
-                "game": {"event": after == "event", "loading": after == "loading", "age": state["age"],
+                "game": {"event": after == "event" or arrival, "loading": after == "loading", "age": state["age"],
                          "frame": frame},
                 "renderer": renderer}
     if cmd == "wait":
         if req.get("event") == "present":
             state["frame"] += int(req.get("frames", 1))
             return {"ok": True, "frame": state["frame"], "state": "play", "waited": int(req.get("frames", 1))}
+        if req.get("event") == "frame":
+            waited = max(0, int(req["frame"]) - state["frame"])
+            state["frame"] += waited
+            return {"ok": True, "frame": state["frame"], "state": "play", "waited": waited}
         if req.get("event") == "map":
             return {"ok": True, "frame": frame, "state": "play", "waited": 0, "map": state["map"]}
         if req.get("event") == "loading_end":
@@ -171,6 +180,7 @@ def reply(req):
             return {"ok": False, "frame": frame, "error": "refused", "message": "no map for this age here"}
         state["map"] = target
         state["frame"] += 1   # the teleport takes one present, after its reply
+        state["arriving"] = True
         return {"ok": True, "frame": frame, "teleport": 1, "child": dest["child"], "adult": dest["adult"],
                 "sent": True, "map": target}
     if cmd == "age":
@@ -571,9 +581,11 @@ class CrawlRunTests(Fixture):
     def test_r2_each_visit_settles_then_turns_the_stick_right_inside_one_window(self):
         status, out, job_id = self.crawl()
         self.assertEqual(status, 0, out)
-        steps = [(r["cmd"], r["frames"]) for r in self.requests()
-                 if r["cmd"] == "stick" or (r["cmd"] == "wait" and r.get("event") == "present")]
-        self.assertEqual(steps, [("wait", SETTLE)] + [("wait", SETTLE), ("stick", PAN), ("wait", PAN)] * 4)
+        steps = [(r["cmd"], r.get("event"), r.get("frames")) for r in self.requests()
+                 if r["cmd"] == "stick" or (r["cmd"] == "wait" and r.get("event") in ("present", "frame"))]
+        self.assertEqual(steps, [("wait", "present", SETTLE)]
+                         + [("wait", "present", SETTLE), ("stick", None, PAN), ("wait", "frame", None)] * 4)
+        self.assertTrue(all(isinstance(r["frame"], int) for r in self.requests("wait") if r.get("event") == "frame"))
         for r in self.requests("stick"):
             self.assertEqual((r["stick"], r["x"], r["y"], r["wait"]), ("R", 1, 0, False))
         for r in self.requests("wait"):

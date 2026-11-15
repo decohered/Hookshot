@@ -1,18 +1,22 @@
 """scripts/harness/bridge.py, the harness's session over one control connection, against a scripted fake connection and a
 fake clock. Checks: arrival by teleport, after the game settles (an event playing at the start is waited out before the
-teleport is sent, and a settle that does not come raises before it), confirmed by the reported map with no load or event
-pending (a refusal, a wrong map, a map that never arrives, and a load or event that never ends each raise, naming what
-failed, and nothing is retried); a status counts for a check only when its game.frame is an integer at or after the
-frame the check needs, else it is read again every POLL_SECONDS, and one that never gets there raises naming the frames,
-while a status without a game.frame never counts; the one request repeated, a teleport the game refuses because an event
-is playing or because the game's event manager declined it, sent again after a poll and a settle until the deadline
-SETTLE_SECONDS after the first settle began, which raises the refusal when it passes, while any other refusal or error
-raises at once; the 8 s gap from the end of a
-teleport or age switch, however it ended, to the next, by the clock; an age switch waiting for its load, and an age
-already set sending nothing more; the renderer being the expected device; a window that fails on a map change or a load
-and returns both its statuses when steady; and entering play: the status polled until menu or play within its timeout,
-then the press limit, each press given its paced time by
-the clock however fast the game presents. No socket, game, GPU or host is used.
+teleport is sent, and a settle that does not come raises before it), then after the teleport's arrival event begins
+(a status read at or after the teleport's frame + 1 on the reported map with the event playing; a begin that does not
+come raises naming the event, the map and the last status; an event on the old map or before that frame is not the
+begin; a fresh status on another map raises at once) and ends (play with no event or load, each status after a one-frame
+present, as the begin is read), confirmed by the reported map (a refusal, a wrong map, a map that never arrives, and a
+load or event that never ends each raise, naming what failed, and nothing is retried); a status counts for a check only
+when its game.frame is an integer at or after the frame the check needs, else it is read again (every POLL_SECONDS by a
+settle, after each one-frame present by the arrival and by a window), and one that never gets there raises naming the
+frames, while a status without a game.frame never counts; the one request repeated, a teleport the game refuses because
+an event is playing or because the game's event manager declined it, sent again after a poll and a settle until the
+deadline SETTLE_SECONDS after the first settle began, which raises the refusal when it passes, while any other refusal
+or error raises at once; the 8 s gap from the end of a teleport or age switch, however it ended, to the next, by the
+clock; an age switch waiting for its load, and an age already set sending nothing more; the renderer being the expected
+device; a window of frames, each step waiting for an absolute game frame counted from the first status, that fails on a
+map change or a load and returns both its statuses when steady; and entering play: the status polled until menu or play
+within its timeout, then the press limit, each press given its paced time by the clock however fast the game presents.
+No socket, game, GPU or host is used.
 
 python -I -B tests/test_harness_bridge.py
 """
@@ -104,11 +108,11 @@ class ArriveTests(unittest.TestCase):
         s, conn, _ = session({
             "teleport": [ok(sent=True, map="map_b")],
             "wait": [ok(state="play", waited=187, map="map_b")],
-            "status": [status("map_a"), status("map_b", frame=101)],
+            "status": [status("map_a"), status("map_b", event=True, frame=101), status("map_b", frame=102)],
         })
         self.assertEqual(s.arrive("dest_a"), "map_b")
         self.assertEqual(requests(conn), [("status", {}), ("teleport", {"to": "dest_a"}),
-                                          ("wait", {"event": "map", "map": "map_b"}), ("status", {})])
+                                          ("wait", {"event": "map", "map": "map_b"}), ("status", {}), ("status", {})])
 
     def test_a_refused_teleport_raises_naming_the_refusal_and_is_not_retried(self):
         s, conn, _ = session({
@@ -124,14 +128,15 @@ class ArriveTests(unittest.TestCase):
 
     def test_a_teleport_refused_for_an_event_waits_a_poll_settles_and_is_sent_again(self):
         s, conn, clock = session({
-            "status": [status("map_b"), status("map_b"), status("map_b", frame=101)],
+            "status": [status("map_b"), status("map_b"), status("map_b", event=True, frame=101),
+                       status("map_b", frame=102)],
             "teleport": [failed("refused", "an event is playing"), ok(sent=True, map="map_b")],
             "wait": [ok(state="play", waited=5, map="map_b")],
         })
         self.assertEqual(s.arrive("dest_a"), "map_b")
         self.assertEqual(requests(conn), [("status", {}), ("teleport", {"to": "dest_a"}), ("status", {}),
                                           ("teleport", {"to": "dest_a"}), ("wait", {"event": "map", "map": "map_b"}),
-                                          ("status", {})])
+                                          ("status", {}), ("status", {})])
         self.assertEqual([t for cmd, _, t in conn.sent if cmd == "teleport"], [0.0, POLL_SECONDS])
         self.assertEqual(clock.slept, [POLL_SECONDS])
 
@@ -170,14 +175,15 @@ class ArriveTests(unittest.TestCase):
 
     def test_a_teleport_declined_by_the_event_manager_is_sent_again_and_arrives(self):
         s, conn, clock = session({
-            "status": [status("map_b"), status("map_b"), status("map_b", frame=101)],
+            "status": [status("map_b"), status("map_b"), status("map_b", event=True, frame=101),
+                       status("map_b", frame=102)],
             "teleport": [failed("refused", DECLINED), ok(sent=True, map="map_b")],
             "wait": [ok(state="play", waited=5, map="map_b")],
         })
         self.assertEqual(s.arrive("dest_a"), "map_b")
         self.assertEqual(requests(conn), [("status", {}), ("teleport", {"to": "dest_a"}), ("status", {}),
                                           ("teleport", {"to": "dest_a"}), ("wait", {"event": "map", "map": "map_b"}),
-                                          ("status", {})])
+                                          ("status", {}), ("status", {})])
         self.assertEqual([t for cmd, _, t in conn.sent if cmd == "teleport"], [0.0, POLL_SECONDS])
         self.assertEqual(clock.slept, [POLL_SECONDS])
 
@@ -235,8 +241,8 @@ class ArriveTests(unittest.TestCase):
         s, conn, clock = session({
             "teleport": [ok(sent=True, map="map_b")],
             "wait": [ok(state="play", waited=5, map="map_b")],
-            "status": [status(), status("map_b", loading=True, frame=101)],
-        })
+            "status": [status(), status("map_b", event=True, frame=101), status("map_b", loading=True, frame=102)],
+        }, takes={"wait": 1.0})
         with self.assertRaises(BridgeError) as raised:
             s.arrive("dest_a")
         self.assertIn("loading True", str(raised.exception))
@@ -244,53 +250,55 @@ class ArriveTests(unittest.TestCase):
         self.assertGreaterEqual(clock.now, 60)
 
     def test_an_event_that_never_ends_raises_naming_it(self):
-        s, conn, _ = session({
+        s, conn, clock = session({
             "teleport": [ok(sent=True, map="map_b")],
             "wait": [ok(state="play", waited=5, map="map_b")],
             "status": [status(), status("map_b", event=True, frame=101)],
-        })
+        }, takes={"wait": 1.0})
         with self.assertRaises(BridgeError) as raised:
             s.arrive("dest_a")
         self.assertIn("event True", str(raised.exception))
         self.assertEqual([cmd for cmd, _ in requests(conn)].count("teleport"), 1)
+        self.assertEqual(clock.slept, [])
 
     def test_an_age_is_switched_before_the_teleport_and_the_gap_applies_after_it(self):
         s, conn, clock = session({
             "age": [ok(age="age_b", sent=True, map="map_c")],
             "wait": [ok(state="play", waited=900, map="map_c"), ok(state="play", waited=5, map="map_b")],
             "teleport": [ok(sent=True, map="map_b")],
-            "status": [status("map_b"), status("map_b", frame=101)],
+            "status": [status("map_b"), status("map_b", event=True, frame=101), status("map_b", frame=102)],
         })
         self.assertEqual(s.arrive("dest_a", age="age_b"), "map_b")
         self.assertEqual(requests(conn), [("age", {"to": "age_b"}), ("wait", {"event": "loading_end"}),
                                           ("status", {}), ("teleport", {"to": "dest_a"}),
-                                          ("wait", {"event": "map", "map": "map_b"}), ("status", {})])
+                                          ("wait", {"event": "map", "map": "map_b"}), ("status", {}), ("status", {})])
         self.assertEqual(clock.slept, [8.0])
 
     def test_a_settled_game_gets_one_status_read_before_the_teleport_and_no_sleep(self):
         s, conn, clock = session({
             "teleport": [ok(sent=True, map="map_b")],
             "wait": [ok(state="play", waited=5, map="map_b")],
-            "status": [status("map_a"), status("map_b", frame=101)],
+            "status": [status("map_a"), status("map_b", event=True, frame=101), status("map_b", frame=102)],
         })
         self.assertEqual(s.arrive("dest_a"), "map_b")
         self.assertEqual(requests(conn), [("status", {}), ("teleport", {"to": "dest_a"}),
-                                          ("wait", {"event": "map", "map": "map_b"}), ("status", {})])
+                                          ("wait", {"event": "map", "map": "map_b"}), ("status", {}), ("status", {})])
         self.assertEqual(clock.slept, [])
 
     def test_a_teleport_waits_for_an_event_playing_at_the_start_to_end_and_is_refused_before(self):
         event_ends = 10.0
         game = {"map": "map_a"}
-        presents = {"frame": 100}
+        arrival = [status("map_b", event=True, frame=101), status("map_b", frame=102)]
 
         def status_reply(now):
-            return status(game["map"], event=now < event_ends, frame=presents["frame"])
+            if game["map"] == "map_a":
+                return status("map_a", event=now < event_ends)
+            return arrival.pop(0) if len(arrival) > 1 else arrival[0]
 
         def teleport_reply(now):
             if now < event_ends:
                 return failed("refused", "an event is playing")
             game["map"] = "map_b"
-            presents["frame"] += 1   # the teleport takes one present
             return ok(sent=True, map="map_b")
 
         s, conn, _ = session({
@@ -314,23 +322,128 @@ class ArriveTests(unittest.TestCase):
 
     def test_a_settled_status_at_the_teleport_frame_is_not_the_arrival_until_a_later_frame(self):
         s, conn, clock = session({
-            "status": [status("map_a"), status("map_b", frame=100), status("map_b", frame=101)],
+            "status": [status("map_a"), status("map_b", frame=100), status("map_b", event=True, frame=101),
+                       status("map_b", frame=101), status("map_b", frame=102)],
             "teleport": [ok(sent=True, map="map_b", frame=100)],
             "wait": [ok(state="play", waited=5, map="map_b")],
         })
         self.assertEqual(s.arrive("dest_a"), "map_b")
-        self.assertEqual([cmd for cmd, _ in requests(conn)], ["status", "teleport", "wait", "status", "status"])
-        self.assertEqual(clock.slept, [POLL_SECONDS])
+        self.assertEqual([cmd for cmd, _ in requests(conn)],
+                         ["status", "teleport", "wait", "status", "wait", "status", "status", "wait", "status"])
+        self.assertEqual(clock.slept, [])
+
+    def test_arrive_returns_after_the_status_that_follows_the_arrival_event_not_in_the_gap_before_it(self):
+        # the teleport at frame 100; the load ends at 147 with the game settled but the arrival event not begun (the
+        # gap, frames 147 to 163); the event plays from 164 to 179; the game is settled from 180
+        gap = [status("map_b", frame=frame) for frame in range(147, 164)]
+        event = [status("map_b", event=True, frame=frame) for frame in range(164, 180)]
+        presents = [ok(state="play", waited=1, frame=frame) for frame in range(148, 180)]
+        # then a window of 120 frames from the settled game at 180: its steps wait for frames 240 and 300
+        s, conn, clock = session({
+            "status": [status("map_a")] + gap + event
+                      + [status("map_b", frame=180), status("map_b", frame=180), status("map_b", frame=240),
+                         status("map_b", frame=300)],
+            "teleport": [ok(sent=True, map="map_b")],
+            "wait": [ok(state="play", waited=47, map="map_b")] + presents
+                    + [ok(state="play", waited=60, frame=240), ok(state="play", waited=60, frame=300)],
+        })
+        self.assertEqual(s.arrive("dest_a"), "map_b")
+        present = ("wait", {"event": "present", "frames": 1})
+        begin = [("status", {})] + [present, ("status", {})] * 17
+        end = [("status", {})] + [present, ("status", {})] * 15
+        self.assertEqual(requests(conn), [("status", {}), ("teleport", {"to": "dest_a"}),
+                                          ("wait", {"event": "map", "map": "map_b"})] + begin + end)
+        self.assertEqual(clock.slept, [])
+        first, last = s.window(120, "map_b")
+        self.assertFalse(last["game"]["event"])
+        self.assertEqual(requests(conn)[-4:], [("wait", {"event": "frame", "frame": 240}), ("status", {}),
+                                               ("wait", {"event": "frame", "frame": 300}), ("status", {})])
+
+    def test_the_arrival_event_ends_at_the_first_settled_status_after_a_one_frame_present(self):
+        s, conn, clock = session({
+            "status": [status("map_a"), status("map_b", event=True, frame=101), status("map_b", event=True, frame=102),
+                       status("map_b", event=True, frame=103), status("map_b", frame=104), status("map_b", frame=105)],
+            "teleport": [ok(sent=True, map="map_b")],
+            "wait": [ok(state="play", waited=5, map="map_b")],
+        })
+        self.assertEqual(s.arrive("dest_a"), "map_b")
+        present = ("wait", {"event": "present", "frames": 1})
+        self.assertEqual(requests(conn), [("status", {}), ("teleport", {"to": "dest_a"}),
+                                          ("wait", {"event": "map", "map": "map_b"}), ("status", {}), ("status", {}),
+                                          present, ("status", {}), present, ("status", {})])
+        self.assertEqual(clock.slept, [])
+
+    def test_an_arrival_event_that_never_begins_raises_after_settle_seconds_naming_the_event_and_the_map(self):
+        s, conn, clock = session({
+            "status": [status("map_a"), status("map_b", frame=147)],
+            "teleport": [ok(sent=True, map="map_b")],
+            "wait": [ok(state="play", waited=47, map="map_b")],
+        }, takes={"wait": 1.0})
+        with self.assertRaises(BridgeError) as raised:
+            s.arrive("dest_a")
+        message = str(raised.exception)
+        self.assertIn("arrival event", message)
+        self.assertIn("'map_b'", message)
+        self.assertIn("event False", message)
+        self.assertIn("loading False", message)
+        self.assertIn("game.frame 147", message)
+        self.assertEqual(clock.now, 1.0 + SETTLE_SECONDS)
+        self.assertEqual([cmd for cmd, _ in requests(conn)].count("teleport"), 1)
+
+    def test_an_event_read_before_the_teleports_frame_plus_one_or_on_the_old_map_is_not_the_begin(self):
+        for stale in (status("map_b", event=True, frame=100), status("map_a", event=True, frame=100)):
+            with self.subTest(map=stale["map"]):
+                s, conn, clock = session({
+                    "status": [status("map_a"), stale, status("map_b", event=True, frame=101),
+                               status("map_b", frame=102)],
+                    "teleport": [ok(sent=True, map="map_b")],
+                    "wait": [ok(state="play", waited=5, map="map_b")],
+                })
+                self.assertEqual(s.arrive("dest_a"), "map_b")
+                self.assertEqual(requests(conn), [("status", {}), ("teleport", {"to": "dest_a"}),
+                                                  ("wait", {"event": "map", "map": "map_b"}), ("status", {}),
+                                                  ("wait", {"event": "present", "frames": 1}), ("status", {}),
+                                                  ("status", {})])
+                self.assertEqual(clock.slept, [])
+
+    def test_a_fresh_status_on_the_old_map_raises_the_wrong_map_error_at_once_even_with_the_event_playing(self):
+        s, conn, _ = session({
+            "status": [status("map_a"), status("map_a", event=True, frame=101)],
+            "teleport": [ok(sent=True, map="map_b")],
+            "wait": [ok(state="play", waited=5, map="map_b")],
+        })
+        with self.assertRaises(BridgeError) as raised:
+            s.arrive("dest_a")
+        message = str(raised.exception)
+        self.assertIn("map_a", message)
+        self.assertIn("map_b", message)
+        self.assertEqual(requests(conn)[-1], ("status", {}))
+        self.assertNotIn(("wait", {"event": "present", "frames": 1}), requests(conn))
+
+    def test_the_arrival_event_is_read_after_each_one_frame_present_and_never_after_a_poll(self):
+        s, conn, clock = session({
+            "status": [status("map_a"), status("map_b", frame=147), status("map_b", frame=148),
+                       status("map_b", event=True, frame=149), status("map_b", frame=150)],
+            "teleport": [ok(sent=True, map="map_b")],
+            "wait": [ok(state="play", waited=47, map="map_b"), ok(state="play", waited=1)],
+        })
+        self.assertEqual(s.arrive("dest_a"), "map_b")
+        present = ("wait", {"event": "present", "frames": 1})
+        self.assertEqual(requests(conn), [("status", {}), ("teleport", {"to": "dest_a"}),
+                                          ("wait", {"event": "map", "map": "map_b"}), ("status", {}), present,
+                                          ("status", {}), present, ("status", {}), ("status", {})])
+        self.assertEqual(clock.slept, [])
 
 
 class SwitchGapTests(unittest.TestCase):
     def script(self):
-        # two arrivals: the first teleport is sent at frame 100 and the second at 101, each taking one present
+        # two arrivals: the first teleport is sent at frame 100 and the second at 101, each taking one present; each
+        # arrival's event begins at the frame after its teleport, and the game is settled after it
         return {
             "teleport": [ok(sent=True, map="map_b", frame=100), ok(sent=True, map="map_b", frame=101)],
             "wait": [ok(state="play", waited=5, map="map_b")],
-            "status": [status("map_b", frame=100), status("map_b", frame=101), status("map_b", frame=101),
-                       status("map_b", frame=102)],
+            "status": [status("map_b", frame=100), status("map_b", event=True, frame=101), status("map_b", frame=102),
+                       status("map_b", frame=102), status("map_b", event=True, frame=102), status("map_b", frame=103)],
         }
 
     def test_a_second_teleport_within_eight_seconds_waits_out_the_rest(self):
@@ -353,7 +466,7 @@ class SwitchGapTests(unittest.TestCase):
             "age": [ok(age="age_b", sent=True, map="map_c")],
             "wait": [ok(state="play", waited=900, map="map_c")],
             "teleport": [ok(sent=True, map="map_b")],
-            "status": [status("map_b"), status("map_b", frame=101)],
+            "status": [status("map_b"), status("map_b", event=True, frame=101), status("map_b", frame=102)],
         })
         s.age("age_b")
         clock.now = 2.0
@@ -371,7 +484,8 @@ class SwitchGapTests(unittest.TestCase):
         s, conn, _ = session({
             "teleport": [ok(sent=True, map="map_b", frame=100), ok(sent=True, map="map_b", frame=101)],
             "wait": [failed("timeout", "no map change"), ok(state="play", waited=5, map="map_b")],
-            "status": [status("map_b", frame=100), status("map_b", frame=101), status("map_b", frame=102)],
+            "status": [status("map_b", frame=100), status("map_b", frame=101), status("map_b", event=True, frame=102),
+                       status("map_b", frame=103)],
         }, takes={"wait": 30})
         with self.assertRaises(BridgeError):
             s.arrive("dest_a")
@@ -382,7 +496,8 @@ class SwitchGapTests(unittest.TestCase):
         s, conn, _ = session({
             "teleport": [failed("refused", "no such destination"), ok(sent=True, map="map_b", frame=100)],
             "wait": [ok(state="play", waited=5, map="map_b")],
-            "status": [status("map_b", frame=100), status("map_b", frame=100), status("map_b", frame=101)],
+            "status": [status("map_b", frame=100), status("map_b", frame=100),
+                       status("map_b", event=True, frame=101), status("map_b", frame=102)],
         }, takes={"teleport": 5})
         with self.assertRaises(BridgeError):
             s.arrive("dest_a")
@@ -394,7 +509,7 @@ class SwitchGapTests(unittest.TestCase):
             "age": [ok(age="age_b", sent=True, map="map_c")],
             "wait": [ok(state="play", waited=900, map="map_c")],
             "teleport": [ok(sent=True, map="map_b")],
-            "status": [status("map_b"), status("map_b", frame=101)],
+            "status": [status("map_b"), status("map_b", event=True, frame=101), status("map_b", frame=102)],
         }, takes={"wait": 20})
         s.age("age_b")
         s.arrive("dest_a")
@@ -405,7 +520,7 @@ class SwitchGapTests(unittest.TestCase):
             "age": [failed("refused", "an event is playing")],
             "teleport": [ok(sent=True, map="map_b")],
             "wait": [ok(state="play", waited=5, map="map_b")],
-            "status": [status("map_b"), status("map_b", frame=101)],
+            "status": [status("map_b"), status("map_b", event=True, frame=101), status("map_b", frame=102)],
         }, takes={"age": 5})
         with self.assertRaises(BridgeError):
             s.age("age_b")
@@ -474,7 +589,7 @@ class WindowTests(unittest.TestCase):
         self.assertEqual((first["frame"], last["frame"]), (100, 220))
         self.assertEqual(last["replayed"], 219)
         waits = [args for cmd, args in requests(conn) if cmd == "wait"]
-        self.assertEqual(waits, [{"event": "present", "frames": 60}] * 2)
+        self.assertEqual(waits, [{"event": "frame", "frame": 160}, {"event": "frame", "frame": 220}])
 
     def test_the_window_steps_in_sixties_and_takes_the_rest(self):
         s, conn, _ = session({
@@ -483,7 +598,26 @@ class WindowTests(unittest.TestCase):
         })
         s.window(90, "map_a")
         waits = [args for cmd, args in requests(conn) if cmd == "wait"]
-        self.assertEqual(waits, [{"event": "present", "frames": 60}, {"event": "present", "frames": 30}])
+        self.assertEqual(waits, [{"event": "frame", "frame": 160}, {"event": "frame", "frame": 190}])
+
+    def test_the_window_counts_its_frames_from_the_first_statuss_game_frame(self):
+        s, conn, _ = session({
+            "status": [status(frame=100, game_frame=103), status(frame=163), status(frame=223)],
+            "wait": [ok(state="play", waited=60, frame=163), ok(state="play", waited=60, frame=223)],
+        })
+        first, last = s.window(120, "map_a")
+        self.assertEqual((first["game"]["frame"], last["game"]["frame"]), (103, 223))
+        waits = [args for cmd, args in requests(conn) if cmd == "wait"]
+        self.assertEqual(waits, [{"event": "frame", "frame": 163}, {"event": "frame", "frame": 223}])
+
+    def test_a_wait_that_overshoots_its_frame_does_not_lengthen_the_next_step(self):
+        s, conn, _ = session({
+            "status": [status(frame=100), status(frame=170), status(frame=220)],
+            "wait": [ok(state="play", waited=70, frame=170), ok(state="play", waited=50, frame=220)],
+        })
+        s.window(120, "map_a")
+        waits = [args for cmd, args in requests(conn) if cmd == "wait"]
+        self.assertEqual(waits, [{"event": "frame", "frame": 160}, {"event": "frame", "frame": 220}])
 
     def test_a_map_change_inside_the_window_raises_and_stops_there(self):
         s, conn, _ = session({
@@ -530,11 +664,6 @@ class FreshnessTests(unittest.TestCase):
         self.assertEqual(requests(conn), [("status", {}), ("status", {})])
         self.assertEqual(clock.slept, [POLL_SECONDS])
 
-    def test_settle_reads_at_the_frame_its_caller_passes_over_its_first_status_frame(self):
-        s, conn, _ = session({"status": [status(frame=100), status(frame=105)]})
-        self.assertEqual(s.settle(SETTLE_SECONDS, frame=105)["frame"], 105)
-        self.assertEqual(requests(conn), [("status", {}), ("status", {})])
-
     def test_a_status_that_never_reaches_its_frame_raises_naming_both_after_settle_seconds(self):
         s, _, clock = session({"status": [status(frame=100, game_frame=90)]})
         with self.assertRaises(BridgeError) as raised:
@@ -551,38 +680,48 @@ class FreshnessTests(unittest.TestCase):
                 with self.assertRaises(BridgeError):
                     s.settle(SETTLE_SECONDS)
                 self.assertEqual(clock.now, SETTLE_SECONDS)
-                s, _, clock = session({"status": [with_game(status(), frame=game_frame)]})
+                s, _, clock = session({"status": [with_game(status(), frame=game_frame)],
+                                       "wait": [ok(state="play", waited=1)]}, takes={"wait": 1.0})
                 with self.assertRaises(BridgeError):
                     s.window(120, "map_a")
                 self.assertEqual(clock.now, SETTLE_SECONDS)
 
     def test_a_window_rereads_a_stale_steady_status_and_fails_on_the_fresh_event(self):
-        s, conn, _ = session({"status": [status(game_frame=99), status(event=True)]})
+        s, conn, clock = session({
+            "status": [status(game_frame=99), status(event=True)],
+            "wait": [ok(state="play", waited=1)],
+        })
         with self.assertRaises(BridgeError) as raised:
             s.window(120, "map_a")
         self.assertIn("event True", str(raised.exception))
-        self.assertEqual(requests(conn), [("status", {}), ("status", {})])
+        self.assertEqual(requests(conn), [("status", {}), ("wait", {"event": "present", "frames": 1}),
+                                          ("status", {})])
+        self.assertEqual(clock.slept, [])
 
-    def test_a_window_status_after_a_wait_is_read_again_until_its_game_frame_reaches_the_wait_frame(self):
-        s, conn, _ = session({
-            "status": [status(frame=100), status(frame=160, game_frame=150), status(frame=160)],
-            "wait": [ok(state="play", waited=60, frame=160)],
+    def test_a_window_status_behind_its_wait_frame_is_read_after_one_frame_presents_and_never_after_a_poll(self):
+        s, conn, clock = session({
+            "status": [status(frame=100), status(frame=160, game_frame=159), status(frame=161, game_frame=160)],
+            "wait": [ok(state="play", waited=60, frame=160), ok(state="play", waited=1, frame=161)],
         })
         s.window(60, "map_a")
-        self.assertEqual(requests(conn), [("status", {}), ("wait", {"event": "present", "frames": 60}),
-                                          ("status", {}), ("status", {})])
+        self.assertEqual(requests(conn), [("status", {}), ("wait", {"event": "frame", "frame": 160}),
+                                          ("status", {}), ("wait", {"event": "present", "frames": 1}),
+                                          ("status", {})])
+        self.assertEqual(clock.slept, [])
 
     def test_a_window_status_that_never_reaches_the_wait_frame_raises_naming_both_after_settle_seconds(self):
-        s, _, clock = session({
+        # each wait takes a second by the clock; the window's deadline runs from the end of its frame wait
+        s, conn, clock = session({
             "status": [status(frame=100), status(frame=160, game_frame=150)],
             "wait": [ok(state="play", waited=60, frame=160)],
-        })
+        }, takes={"wait": 1.0})
         with self.assertRaises(BridgeError) as raised:
             s.window(120, "map_a")
         message = str(raised.exception)
         self.assertIn("frame 160", message)
         self.assertIn("game.frame 150", message)
-        self.assertEqual(clock.now, SETTLE_SECONDS)
+        self.assertEqual(requests(conn)[1], ("wait", {"event": "frame", "frame": 160}))
+        self.assertEqual(clock.now, 1.0 + SETTLE_SECONDS)
 
 
 class EnterPlayTests(unittest.TestCase):
